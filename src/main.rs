@@ -1,4 +1,4 @@
-//! rustspek — a Rust port of SoX's `spectrogram` effect.
+//! rustspeck — a Rust port of SoX's `spectrogram` effect.
 //!
 //! Produces a PNG spectrogram bit-compatible with
 //! `sox <in> -n spectrogram [options]`, with a friendlier CLI. Input decoding is
@@ -58,7 +58,7 @@ impl From<WindowArg> for WindowType {
 /// ALAC, AIFF, CAF, …). At most two of --width, --pixels-per-sec and --duration
 /// may be combined, and only one of --height / --total-height.
 #[derive(Parser, Debug)]
-#[command(name = "rustspek", version, about, long_about = None)]
+#[command(name = "rustspeck", version, about, long_about = None)]
 struct Args {
     /// Input audio file (WAV, FLAC, MP3, OGG, AAC, ALAC, …).
     /// Opens in the GUI viewer by default; pass --output to render a PNG instead.
@@ -314,7 +314,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("rustspek: error: {e}");
+            eprintln!("rustspeck: error: {e}");
             ExitCode::FAILURE
         }
     }

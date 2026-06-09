@@ -3363,7 +3363,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustspek"
+name = "rustspeck"
 version = "0.1.0"
 dependencies = [
  "clap",

@@ -1,6 +1,6 @@
 ---
 name: port-status
-description: Status of the SoX spectrogram -> Rust port (rustspek), what's verified and what's left
+description: Status of the SoX spectrogram -> Rust port (rustspeck), what's verified and what's left
 metadata:
   type: project
 ---
@@ -51,7 +51,7 @@ Porting SoX's `spectrogram` effect to Rust (WAV input only). Source of truth: `s
 
 **Verification vs installed SoX (test/ has mono.wav, stereo.wav + generators):**
 - `-r` raw mode (pure spectrogram data): **bit-exact**, 0/410400 px diff. 36/39 x-values in a sweep are 0-diff.
-- Full images: identical except divergences traced to the 14.4.2 binary being a **32-bit x87 build** (80-bit intermediates). Two confirmed signatures, both "true value just below an integer, x87 truncates down, IEEE-754 double rounds up": (1) Z-legend gradient single row, `colour()` `83.999…` vs `84.0` (~14 px); (2) `step_size`/`block_steps` at specific x (e.g. 700: `44100/pps` = 188.99999999999999233 -> x87 188, double 189) which cascades. NOT a port bug — a modern 64-bit SoX build would match rustspek.
+- Full images: identical except divergences traced to the 14.4.2 binary being a **32-bit x87 build** (80-bit intermediates). Two confirmed signatures, both "true value just below an integer, x87 truncates down, IEEE-754 double rounds up": (1) Z-legend gradient single row, `colour()` `83.999…` vs `84.0` (~14 px); (2) `step_size`/`block_steps` at specific x (e.g. 700: `44100/pps` = 188.99999999999999233 -> x87 188, double 189) which cascades. NOT a port bug — a modern 64-bit SoX build would match rustspeck.
 - `-A` alt palette differs because 14.4.2 alt_palette had 169 entries vs 14.4.3git source's 168 (genuine version difference).
 - `-n` normalize: 14.4.2 binary lacks it (`invalid option -n`); it's a 14.4.3git feature, implemented per source.
 

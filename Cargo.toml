@@ -1,5 +1,5 @@
 [package]
-name = "rustspek"
+name = "rustspeck"
 version = "0.1.0"
 edition = "2024"
 
@@ -54,5 +54,5 @@ strip = true        # strip symbols
 [profile.release.package.rustfft]
 opt-level = 3
 
-[profile.release.package.rustspek]
+[profile.release.package.rustspeck]
 opt-level = 3

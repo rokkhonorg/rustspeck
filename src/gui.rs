@@ -33,7 +33,7 @@ use crate::render;
 use crate::spectrogram::{self, Config, Spectrogram, StreamProcessor};
 
 const FONT: &str = "JetBrains Mono";
-const PLACEHOLDER: &str = "Drag and drop an audio file (WAV, FLAC, MP3, OGG, …)";
+const PLACEHOLDER: &str = "Drag and drop an audio file.";
 
 // Fixed render resolution; floem GPU-scales it to fill the centre area.
 const RENDER_COLS: i32 = 2400;
@@ -197,7 +197,7 @@ pub fn run(initial: Option<PathBuf>, fft_size: Option<i32>) -> Result<(), String
             Some(
                 WindowConfig::default()
                     .size(Size::new(WIN_W, WIN_H))
-                    .title("rustspek"),
+                    .title("RustSpeck"),
             ),
         )
         .run();
@@ -227,9 +227,28 @@ fn build_ui(initial: Option<PathBuf>, fft_size: Option<i32>) -> impl IntoView {
     // UI sink: the worker thread sends LoadMsgs here; the handler runs on the UI
     // thread and fans each one out to the signals above (which drive the views).
     let sink = make_sink(move |load_gen, msg| {
+        let cur = LOAD_GEN.load(Ordering::SeqCst);
+        match &msg {
+            LoadMsg::Start(n) => eprintln!("[ui] gen{load_gen}/{cur} Start {n}"),
+            LoadMsg::Meta(m, _) => {
+                eprintln!("[ui] gen{load_gen}/{cur} Meta ch={} cols={}", m.channels, m.cols)
+            }
+            LoadMsg::Frame(r) => eprintln!(
+                "[ui] gen{load_gen}/{cur} Frame n={} dim0={:?}",
+                r.len(),
+                r.first().map(|(w, h, _)| (*w, *h))
+            ),
+            LoadMsg::Done(r) => eprintln!(
+                "[ui] gen{load_gen}/{cur} Done n={} dim0={:?}",
+                r.len(),
+                r.first().map(|(w, h, _)| (*w, *h))
+            ),
+            LoadMsg::Err(e) => eprintln!("[ui] gen{load_gen}/{cur} Err {e}"),
+        }
         // Drop messages from a superseded load (a newer file was dropped while
         // this one was still rendering), so only the active load paints.
-        if load_gen != LOAD_GEN.load(Ordering::SeqCst) {
+        if load_gen != cur {
+            eprintln!("[ui] DROPPED (stale)");
             return;
         }
         match msg {
@@ -271,6 +290,7 @@ fn build_ui(initial: Option<PathBuf>, fft_size: Option<i32>) -> impl IntoView {
         } else {
             let n = texs.len();
             canvas(move |cx, size| {
+                eprintln!("[canvas] n={n} size={}x{}", size.width, size.height);
                 let gap = CHANNEL_GAP_PX;
                 let band_h = ((size.height - (n as f64 - 1.0) * gap) / n as f64).max(1.0);
                 for (k, t) in texs.iter().enumerate() {
@@ -317,7 +337,7 @@ fn build_ui(initial: Option<PathBuf>, fft_size: Option<i32>) -> impl IntoView {
     let title = dyn_view(move || {
         let ti = info.get();
         if ti.line1.is_empty() {
-            Label::derived(|| "rustspek".to_string())
+            Label::derived(|| "RustSpeck".to_string())
                 .style(|s| {
                     s.size_full()
                         .items_center()

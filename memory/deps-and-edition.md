@@ -5,7 +5,7 @@ metadata:
   type: feedback
 ---
 
-Keep `edition = "2024"` in Cargo.toml for the rustspek project — do not downgrade it.
+Keep `edition = "2024"` in Cargo.toml for the rustspeck project — do not downgrade it.
 
 Do NOT edit the `[dependencies]` section of Cargo.toml yourself. When a new external crate is needed, tell the user the exact `cargo add` command(s) and let them run it manually.
 
