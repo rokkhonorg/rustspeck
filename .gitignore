@@ -1,0 +1,7 @@
+/target
+
+# Generated verification artifacts under test/ (spectrogram PNGs, logs, and
+# audio derived from the source fixtures). Keep only the source fixtures.
+/test/*
+!/test/mono.wav
+!/test/stereo.wav

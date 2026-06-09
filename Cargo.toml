@@ -1,0 +1,12 @@
+[package]
+name = "rustspek"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.1", features = ["unicode", "derive"] }
+clap_derive = "4.6.1"
+flate2 = "1.1.9"
+png = { version = "0.18.1", features = ["zlib-rs"] }
+rustfft = { version = "6.4.1", features = ["wasm_simd"] }
+symphonia = { version = "0.6.0", features = ["all"] }
