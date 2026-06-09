@@ -14,10 +14,10 @@ use symphonia::core::audio::sample::{i24, u24};
 // `Audio` is Symphonia's planar-buffer trait (provides `plane`); imported
 // anonymously so it doesn't clash with our own `Audio` struct below.
 use symphonia::core::audio::{Audio as _, GenericAudioBufferRef};
-use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::{FormatOptions, FormatReader};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 
@@ -40,7 +40,76 @@ impl Audio {
     }
 }
 
-pub fn read<P: AsRef<Path>>(path: P) -> Result<Audio, String> {
+/// A streaming decoder: open once, then pull interleaved `sox_sample_t` chunks
+/// one decoded packet at a time. `rate`/`channels` are known after `open`;
+/// `total_frames` is the per-channel length when the container reports it (it
+/// does for WAV/FLAC/MP3/…), which the spectrogram needs to fix its geometry.
+pub struct Decoder {
+    format: Box<dyn FormatReader>,
+    decoder: Box<dyn AudioDecoder>,
+    track_id: u32,
+    rate: u32,
+    channels: u32,
+    total_frames: Option<u64>,
+    /// First decoded chunk, buffered during `open` to learn `rate`/`channels`.
+    pending_first: Option<Vec<i32>>,
+}
+
+impl Decoder {
+    pub fn rate(&self) -> f64 {
+        self.rate as f64
+    }
+    pub fn channels(&self) -> u32 {
+        self.channels
+    }
+    /// Interleaved sample count of the whole stream, if known.
+    pub fn total_len(&self) -> Option<u64> {
+        self.total_frames.map(|f| f * self.channels as u64)
+    }
+
+    /// Decode and return the next packet's interleaved samples, or `None` at the
+    /// end of the stream. Corrupt packets are skipped.
+    pub fn next_chunk(&mut self) -> Result<Option<Vec<i32>>, String> {
+        if let Some(first) = self.pending_first.take() {
+            return Ok(Some(first));
+        }
+        loop {
+            let packet = match self.format.next_packet() {
+                Ok(Some(p)) => p,
+                Ok(None) => return Ok(None),
+                Err(SymphoniaError::IoError(e))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    return Ok(None)
+                }
+                Err(SymphoniaError::ResetRequired) => return Ok(None),
+                Err(e) => return Err(format!("error reading stream: {e}")),
+            };
+            if packet.track_id != self.track_id {
+                continue;
+            }
+            match self.decoder.decode(&packet) {
+                Ok(decoded) => {
+                    let mut chunk = Vec::new();
+                    append_samples(decoded, &mut chunk);
+                    return Ok(Some(chunk));
+                }
+                // A single corrupt packet shouldn't abort the whole decode.
+                Err(SymphoniaError::DecodeError(_)) => continue,
+                Err(SymphoniaError::IoError(e))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    return Ok(None)
+                }
+                Err(e) => return Err(format!("decode error: {e}")),
+            }
+        }
+    }
+}
+
+/// Open a file for streaming decode. Decodes the first packet eagerly to learn
+/// the authoritative sample rate / channel count.
+pub fn open<P: AsRef<Path>>(path: P) -> Result<Decoder, String> {
     let path = path.as_ref();
     let file = File::open(path).map_err(|e| format!("cannot open file: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -59,9 +128,7 @@ pub fn read<P: AsRef<Path>>(path: P) -> Result<Audio, String> {
         )
         .map_err(|e| format!("unsupported or unrecognised audio format: {e}"))?;
 
-    // Pick the first decodable audio track and build its decoder. Scoped so the
-    // immutable borrow of `format` is released before the decode loop below.
-    let (track_id, mut decoder) = {
+    let (track_id, total_frames, mut decoder) = {
         let track = format
             .tracks()
             .iter()
@@ -75,38 +142,37 @@ pub fn read<P: AsRef<Path>>(path: P) -> Result<Audio, String> {
         let decoder = symphonia::default::get_codecs()
             .make_audio_decoder(params, &AudioDecoderOptions::default())
             .map_err(|e| format!("no decoder for this codec: {e}"))?;
-        (track.id, decoder)
+        (track.id, track.num_frames, decoder)
     };
 
+    // Decode packets until the first one for our track yields audio, so we know
+    // the true rate/channels and can buffer that chunk for the first read.
     let mut rate = 0u32;
     let mut channels = 0u32;
-    let mut samples: Vec<i32> = Vec::new();
-
+    let mut pending_first: Option<Vec<i32>> = None;
     loop {
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
-            Ok(None) => break, // clean end of stream
+            Ok(None) => break,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break
             }
             Err(SymphoniaError::ResetRequired) => break,
             Err(e) => return Err(format!("error reading stream: {e}")),
         };
-
         if packet.track_id != track_id {
             continue;
         }
-
         match decoder.decode(&packet) {
             Ok(decoded) => {
-                if rate == 0 {
-                    let spec = decoded.spec();
-                    rate = spec.rate();
-                    channels = spec.channels().count() as u32;
-                }
-                append_samples(decoded, &mut samples);
+                let spec = decoded.spec();
+                rate = spec.rate();
+                channels = spec.channels().count() as u32;
+                let mut chunk = Vec::new();
+                append_samples(decoded, &mut chunk);
+                pending_first = Some(chunk);
+                break;
             }
-            // A single corrupt packet shouldn't abort the whole decode.
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 break
@@ -119,8 +185,32 @@ pub fn read<P: AsRef<Path>>(path: P) -> Result<Audio, String> {
         return Err("could not determine sample rate / channel count".into());
     }
 
+    Ok(Decoder {
+        format,
+        decoder,
+        track_id,
+        rate,
+        channels,
+        total_frames,
+        pending_first,
+    })
+}
+
+/// Decode an entire file into memory (batch path, used by the CLI). Built on the
+/// streaming [`Decoder`].
+pub fn read<P: AsRef<Path>>(path: P) -> Result<Audio, String> {
+    let mut dec = open(path)?;
+    let rate = dec.rate();
+    let channels = dec.channels();
+    let mut samples: Vec<i32> = Vec::new();
+    if let Some(n) = dec.total_len() {
+        samples.reserve(n as usize);
+    }
+    while let Some(chunk) = dec.next_chunk()? {
+        samples.extend_from_slice(&chunk);
+    }
     Ok(Audio {
-        rate: rate as f64,
+        rate,
         channels,
         samples,
     })

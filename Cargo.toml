@@ -7,17 +7,52 @@ edition = "2024"
 clap = { version = "4.6.1", features = ["unicode", "derive"] }
 clap_derive = "4.6.1"
 flate2 = "1.1.9"
-floem = { git = "https://github.com/lapce/floem", rev = "bcafaaad3fbf47091e28a64934295194d8e14463", version = "0.2.0" }
-floem_renderer = { git = "https://github.com/lapce/floem", rev = "bcafaaad3fbf47091e28a64934295194d8e14463", version = "0.2.0" }
+floem = { git = "https://github.com/lapce/floem", rev = "bcafaaad3fbf47091e28a64934295194d8e14463", version = "0.2.0", default-features = false, features = ["editor", "vger", "crossbeam", "serde", "image-png"] }
+floem_renderer = { git = "https://github.com/lapce/floem", rev = "bcafaaad3fbf47091e28a64934295194d8e14463", version = "0.2.0", features = ["crossbeam"] }
 lofty = { version = "0.24.0", features = ["serde"] }
 png = { version = "0.18.1", features = ["zlib-rs"] }
 rayon = "1.12.0"
 rustfft = { version = "6.4.1", features = ["wasm_simd"] }
-symphonia = { version = "0.6.0", features = ["all"] }
+# Trimmed from "all": dropped Matroska (mkv), CAF, and MP1/MP2 to shrink the
+# binary. Keeps the common audio formats incl. M4A/AAC (isomp4 + aac) and ALAC.
+symphonia = { version = "0.6.0", default-features = false, features = [
+    "opt-simd",
+    "all-meta",
+    "wav",
+    "aiff",
+    "flac",
+    "ogg",
+    "mp3",
+    "vorbis",
+    "pcm",
+    "adpcm",
+    "isomp4",
+    "aac",
+    "alac",
+] }
+
+# Redirect floem's transitive `floem-vger` (the wgpu glyph/image atlas backend)
+# to a fork that recycles the atlas when the packer is full. Upstream silently
+# drops images that don't fit, which blanks large/streamed images and any
+# session that loads several files. Based on floem's pinned 54ab813 (no wgpu
+# drift) plus the recycle fix.
+[patch."https://github.com/lapce/vger-rs"]
+floem-vger = { git = "https://github.com/arg274/vger-rs", rev = "402371e928b280e58c455e69b7b9f943ccf1486a" }
 
 [profile.release]
-opt-level = 3       # keep FFT/decode speed; set to "s"/"z" to trade speed for size
+opt-level = "s"     # optimize for size; hot crates overridden to opt-level 3 below
 lto = "fat"         # cross-crate dead-code elimination
 codegen-units = 1   # better optimization / smaller output
 panic = "abort"     # drop unwinding tables
 strip = true        # strip symbols
+
+# Keep the spectrogram hot path fully speed-optimized even though the rest of
+# the binary is built for size: the FFT kernels (rustfft) and our own DSP loops
+# (window multiply, power-spectrum accumulation, dBfs mapping). Both are small in
+# the binary, so pinning them to opt-level 3 costs little size but avoids a large
+# slowdown on big FFTs.
+[profile.release.package.rustfft]
+opt-level = 3
+
+[profile.release.package.rustspek]
+opt-level = 3

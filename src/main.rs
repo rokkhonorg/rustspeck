@@ -181,7 +181,7 @@ struct Args {
     #[arg(short = 't', long, value_name = "TEXT")]
     title: Option<String>,
 
-    /// Footer comment text; default "Created by SoX"
+    /// Footer comment text; default "Created by RustSpeck"
     #[arg(short = 'c', long, value_name = "TEXT")]
     comment: Option<String>,
 }

@@ -66,7 +66,7 @@ impl Default for Config {
             truncate: false,
             win_type: WindowType::Hann,
             title: None,
-            comment: "Created by SoX".to_string(),
+            comment: "Created by RustSpeck".to_string(),
             duration_str: None,
             start_time_str: None,
             out_name: "spectrogram.png".to_string(),
@@ -187,7 +187,7 @@ fn sqr(x: f64) -> f64 {
 }
 
 /// One channel's analysis state machine (the per-flow part of `priv_t`).
-struct Channel<'a> {
+struct Channel {
     g_dft_size: i32,
     g_step_size: i32,
     g_block_steps: i32,
@@ -213,10 +213,10 @@ struct Channel<'a> {
     win: WindowState,
     gain_val: f64,
 
-    dft: &'a mut Dft,
+    dft: Dft,
 }
 
-impl<'a> Channel<'a> {
+impl Channel {
     /// `do_column`: emit one spectrogram column from the accumulated magnitudes.
     /// Returns false when the image is full (the SOX_EOF case).
     fn do_column(&mut self) -> bool {
@@ -350,8 +350,8 @@ pub fn process(cfg: Config, rate: f64, channels: u32, samples: &[i32]) -> Result
                 f += chans;
             }
 
-            let mut dft = Dft::new(geom.dft_size as usize);
-            let mut channel = make_channel(&cfg, &geom, &mut dft);
+            let dft = Dft::new(geom.dft_size as usize);
+            let mut channel = make_channel(&cfg, &geom, dft);
             channel.flow(&mono, &cfg);
             channel.drain(&cfg);
 
@@ -390,6 +390,122 @@ struct ChannelOutput {
     dbfs: Vec<f32>,
     max: f64,
     cols: i32,
+}
+
+/// `sox_sample_t` (i32, full-scale ±2^31) → the [-1, 1) float domain SoX's DSP
+/// works in. Same scale used by the batch `process` path above.
+const SAMPLE_SCALE: f64 = 1.0 / (0x7FFF_FFFFu32 as f64 + 1.0);
+
+/// Streaming variant of [`process`]: the geometry is fixed up front (the total
+/// length must be known), then sample chunks are fed in with [`push`](StreamProcessor::push)
+/// and columns are produced incrementally. Used by the GUI to render a
+/// spectrogram progressively as the file decodes. The final pixels are identical
+/// to the batch path for the same input.
+pub struct StreamProcessor {
+    cfg: Config,
+    geom: Geometry,
+    chans: usize,
+    rate: f64,
+    channels: Vec<Channel>,
+}
+
+impl StreamProcessor {
+    /// `total_len` is the interleaved sample count of the whole input (frames ×
+    /// channels) — required to fix the time geometry before any samples arrive.
+    pub fn new(cfg: Config, rate: f64, channels: u32, total_len: u64) -> Result<Self, String> {
+        let chans = channels as usize;
+        if chans == 0 {
+            return Err("input has no channels".into());
+        }
+        let geom = compute_geometry(&cfg, rate, channels, total_len)?;
+        let chan_states = (0..chans)
+            .map(|_| make_channel(&cfg, &geom, Dft::new(geom.dft_size as usize)))
+            .collect();
+        Ok(StreamProcessor {
+            cfg,
+            geom,
+            chans,
+            rate,
+            channels: chan_states,
+        })
+    }
+
+    /// Feed an interleaved chunk of `sox_sample_t` samples. Channels are advanced
+    /// in parallel (each owns its own FFT plan + buffers).
+    pub fn push(&mut self, interleaved: &[i32]) {
+        let chans = self.chans;
+        let cfg = &self.cfg;
+        self.channels.par_iter_mut().enumerate().for_each(|(ch, c)| {
+            let mono: Vec<f64> = interleaved[ch..]
+                .iter()
+                .step_by(chans)
+                .map(|&s| s as f64 * SAMPLE_SCALE)
+                .collect();
+            c.flow(&mono, cfg);
+        });
+    }
+
+    /// Flush the trailing partial block on every channel (the `drain` step).
+    pub fn finish(&mut self) {
+        let cfg = &self.cfg;
+        self.channels.par_iter_mut().for_each(|c| c.drain(cfg));
+    }
+
+    /// Columns produced so far (all channels advance in lockstep on the same
+    /// input, so channel 0 is representative).
+    pub fn cols_done(&self) -> i32 {
+        self.channels.first().map_or(0, |c| c.cols)
+    }
+
+    pub fn x_size(&self) -> i32 {
+        self.geom.x_size
+    }
+    pub fn rows(&self) -> i32 {
+        self.geom.rows
+    }
+    pub fn chans(&self) -> usize {
+        self.chans
+    }
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+    pub fn step_size(&self) -> i32 {
+        self.geom.step_size
+    }
+    pub fn block_steps(&self) -> i32 {
+        self.geom.block_steps
+    }
+    pub fn cfg(&self) -> &Config {
+        &self.cfg
+    }
+
+    /// One channel's accumulated dBfs columns so far (column-major, length
+    /// `cols_done * rows`).
+    pub fn channel_dbfs(&self, ch: usize) -> &[f32] {
+        &self.channels[ch].dbfs
+    }
+
+    /// Consume the processor into a finished [`Spectrogram`]; call after
+    /// [`finish`](Self::finish). Equivalent pixels to the batch [`process`].
+    pub fn into_spectrogram(self) -> Spectrogram {
+        let ch0_max = self
+            .channels
+            .first()
+            .map_or(-(self.cfg.db_range as f64), |c| c.max);
+        let cols = self.channels.first().map_or(0, |c| c.cols);
+        let dbfs_all: Vec<Vec<f32>> = self.channels.into_iter().map(|c| c.dbfs).collect();
+        Spectrogram {
+            chans: self.chans,
+            rows: self.geom.rows,
+            cols,
+            step_size: self.geom.step_size,
+            block_steps: self.geom.block_steps,
+            rate: self.rate,
+            dbfs: dbfs_all,
+            max: ch0_max,
+            cfg: self.cfg,
+        }
+    }
 }
 
 fn compute_geometry(
@@ -490,7 +606,7 @@ fn compute_geometry(
     })
 }
 
-fn make_channel<'a>(cfg: &Config, geom: &Geometry, dft: &'a mut Dft) -> Channel<'a> {
+fn make_channel(cfg: &Config, geom: &Geometry, dft: Dft) -> Channel {
     let dft_size = geom.dft_size;
     let mut win = WindowState {
         dft_size,

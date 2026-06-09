@@ -4,7 +4,7 @@
 
 use std::io::{Read, Write};
 
-use crate::spectrogram::{Config, Spectrogram};
+use crate::spectrogram::{Config, Spectrogram, StreamProcessor};
 use crate::tables::{ALT_PALETTE, FIXED_FONT_ZLIB};
 
 // Layout constants (#defines in spectrogram.c)
@@ -388,30 +388,78 @@ pub fn render_png<W: Write>(spec: &Spectrogram, mut out: W) -> Result<(), String
 /// with a real background gap between them rather than baking it into one image.
 fn channel_rgba(spec: &Spectrogram, k: usize) -> (usize, usize, Vec<u8>) {
     let cfg = &spec.cfg;
-    let p_rows = spec.rows;
-    let p_cols = spec.cols;
-    let w = p_cols.max(1) as usize;
-    let h = p_rows.max(1) as usize;
-
-    let palette = make_palette(cfg);
     let autogain = if cfg.normalize { -spec.max } else { 0.0 };
-    let dbfs = &spec.dbfs[k];
+    let tex_rows = gui_tex_rows(spec.rows, spec.chans);
+    dbfs_to_rgba(cfg, &spec.dbfs[k], spec.rows, spec.cols, spec.cols, tex_rows, autogain)
+}
+
+/// Per-channel texture height for the GUI. We keep full frequency resolution in
+/// the dBfs data and the PNG/CLI output, but the GPU textures are capped so all
+/// channels' textures fit together in floem/vger's shared atlas, which only
+/// holds a handful of large regions (a 2400-wide region takes a full atlas row).
+/// Without this, a multi-channel file with a tall FFT overflows the atlas: some
+/// channels never paint and the atlas thrashes (re-uploading every frame, which
+/// is what makes resizing stutter). The bands are small on screen, so capping
+/// the texture height is visually imperceptible.
+fn gui_tex_rows(rows: i32, chans: usize) -> i32 {
+    // Vertical texture budget shared across channels. Keeps the atlas square
+    // side (2 * max dimension) within GPU limits and leaves room for the legend.
+    const TOTAL_BUDGET: i32 = 3600;
+    let cap = (TOTAL_BUDGET / chans.max(1) as i32).max(1);
+    rows.min(cap)
+}
+
+/// Colour one channel's dBfs columns into a top-down RGBA8 buffer of width
+/// `total_cols × rows` (high frequency at top). Columns `0..cols_filled` are
+/// taken from `dbfs` (column-major: `dbfs[col*rows + row]`); any remaining
+/// columns up to `total_cols` are left as the background palette colour, which
+/// is how the GUI grows the image left-to-right while a file streams in.
+pub fn dbfs_to_rgba(
+    cfg: &Config,
+    dbfs: &[f32],
+    rows: i32,
+    cols_filled: i32,
+    total_cols: i32,
+    tex_rows: i32,
+    autogain: f64,
+) -> (usize, usize, Vec<u8>) {
+    let w = total_cols.max(1) as usize;
+    // Output texture height; never upsample past the real row count. When
+    // `tex_rows == rows` this is an exact 1:1 copy (the mapping below reduces to
+    // `j = rows - 1 - r`); when smaller, frequency bins are nearest-sampled.
+    let h = tex_rows.clamp(1, rows.max(1)) as usize;
+    let palette = make_palette(cfg);
+    let bg = [palette[0], palette[1], palette[2]];
 
     let mut rgba = vec![0u8; w * h * 4];
-    for j in 0..p_rows {
-        let row = (p_rows - 1 - j) as usize; // high frequency at the top
-        let ro = row * w * 4;
-        for i in 0..p_cols {
-            let v = dbfs[(i * p_rows + j) as usize] as f64 + autogain;
+    // Background fill first (covers the not-yet-computed columns).
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] = bg[0];
+        px[1] = bg[1];
+        px[2] = bg[2];
+        px[3] = 0xff;
+    }
+    let filled = cols_filled.min(total_cols);
+    let rows_span = (rows - 1).max(0) as f64;
+    let denom = (h as i32 - 1).max(1) as f64;
+    for r in 0..h {
+        // Output row r (0 = top = Nyquist) → source frequency bin j (0 = DC).
+        let j = if h == 1 {
+            rows - 1
+        } else {
+            ((1.0 - r as f64 / denom) * rows_span).round() as i32
+        }
+        .clamp(0, rows - 1);
+        let ro = r * w * 4;
+        for i in 0..filled {
+            let v = dbfs[(i * rows + j) as usize] as f64 + autogain;
             let idx = colour(cfg, v) as usize * 3;
             let o = ro + i as usize * 4;
             rgba[o] = palette[idx];
             rgba[o + 1] = palette[idx + 1];
             rgba[o + 2] = palette[idx + 2];
-            rgba[o + 3] = 0xff;
         }
     }
-
     (w, h, rgba)
 }
 
@@ -435,6 +483,22 @@ fn encode_rgba_png(w: usize, h: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
 /// The GUI uploads these directly to GPU textures (no PNG round-trip).
 pub fn channel_images(spec: &Spectrogram) -> Vec<(usize, usize, Vec<u8>)> {
     (0..spec.chans).map(|k| channel_rgba(spec, k)).collect()
+}
+
+/// Per-channel partial RGBA snapshot from a streaming processor: each image is
+/// the full target width (`x_size`), with only the columns produced so far
+/// painted and the rest left as background. Normalisation is intentionally not
+/// applied here (the global max isn't known mid-stream); the GUI uses the
+/// default, non-normalised config.
+pub fn stream_channel_images(proc: &StreamProcessor) -> Vec<(usize, usize, Vec<u8>)> {
+    let cfg = proc.cfg();
+    let rows = proc.rows();
+    let total = proc.x_size();
+    let filled = proc.cols_done();
+    let tex_rows = gui_tex_rows(rows, proc.chans());
+    (0..proc.chans())
+        .map(|k| dbfs_to_rgba(cfg, proc.channel_dbfs(k), rows, filled, total, tex_rows, 0.0))
+        .collect()
 }
 
 /// Vertical dBFS colour-scale legend (0 dBFS at top → `-db_range` at bottom)
