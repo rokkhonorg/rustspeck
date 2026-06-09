@@ -383,6 +383,90 @@ pub fn render_png<W: Write>(spec: &Spectrogram, mut out: W) -> Result<(), String
     Ok(())
 }
 
+/// Build one channel's heatmap (cols × rows, high frequency at top) as an RGBA8
+/// top-down buffer. Each channel is a separate image so the GUI can lay them out
+/// with a real background gap between them rather than baking it into one image.
+fn channel_rgba(spec: &Spectrogram, k: usize) -> (usize, usize, Vec<u8>) {
+    let cfg = &spec.cfg;
+    let p_rows = spec.rows;
+    let p_cols = spec.cols;
+    let w = p_cols.max(1) as usize;
+    let h = p_rows.max(1) as usize;
+
+    let palette = make_palette(cfg);
+    let autogain = if cfg.normalize { -spec.max } else { 0.0 };
+    let dbfs = &spec.dbfs[k];
+
+    let mut rgba = vec![0u8; w * h * 4];
+    for j in 0..p_rows {
+        let row = (p_rows - 1 - j) as usize; // high frequency at the top
+        let ro = row * w * 4;
+        for i in 0..p_cols {
+            let v = dbfs[(i * p_rows + j) as usize] as f64 + autogain;
+            let idx = colour(cfg, v) as usize * 3;
+            let o = ro + i as usize * 4;
+            rgba[o] = palette[idx];
+            rgba[o + 1] = palette[idx + 1];
+            rgba[o + 2] = palette[idx + 2];
+            rgba[o + 3] = 0xff;
+        }
+    }
+
+    (w, h, rgba)
+}
+
+fn encode_rgba_png(w: usize, h: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut buf, w as u32, h as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| format!("PNG header error: {e}"))?;
+        writer
+            .write_image_data(rgba)
+            .map_err(|e| format!("PNG write error: {e}"))?;
+    }
+    Ok(buf)
+}
+
+/// One PNG (RGBA) per channel, top channel first. The encode runs off the UI
+/// thread, so default compression is fine.
+pub fn channel_pngs(spec: &Spectrogram) -> Result<Vec<Vec<u8>>, String> {
+    (0..spec.chans)
+        .map(|k| {
+            let (w, h, rgba) = channel_rgba(spec, k);
+            encode_rgba_png(w, h, &rgba)
+        })
+        .collect()
+}
+
+/// Vertical dBFS colour-scale legend (0 dBFS at top → `-db_range` at bottom)
+/// matching the GUI's default palette, as PNG bytes. Stretched in the UI.
+pub fn legend_png(db_range: i32) -> Result<Vec<u8>, String> {
+    let mut cfg = Config::default();
+    cfg.db_range = db_range;
+    let cfg = cfg.finalize()?;
+    let palette = make_palette(&cfg);
+    let w = 24usize;
+    let h = 256usize;
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let frac = y as f64 / (h - 1) as f64; // 0 at top .. 1 at bottom
+        let dbfs = -(cfg.db_range as f64) * frac; // 0 dBFS .. -range
+        let idx = colour(&cfg, dbfs) as usize * 3;
+        for x in 0..w {
+            let o = (y * w + x) * 4;
+            rgba[o] = palette[idx];
+            rgba[o + 1] = palette[idx + 1];
+            rgba[o + 2] = palette[idx + 2];
+            rgba[o + 3] = 0xff;
+        }
+    }
+    encode_rgba_png(w, h, &rgba)
+}
+
 fn draw_legends(
     img: &mut Image,
     spec: &Spectrogram,

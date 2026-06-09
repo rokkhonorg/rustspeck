@@ -4,8 +4,14 @@
 //! `sox <in> -n spectrogram [options]`, with a friendlier CLI. Input decoding is
 //! handled by Symphonia, so any format it supports works (WAV, FLAC, MP3, …).
 
+// Build as a GUI (no console window pops up on launch). We reattach to the
+// parent console at startup (see `attach_parent_console`) so CLI use from a
+// terminal still prints normally.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod audio;
 mod fft;
+mod gui;
 mod render;
 mod spectrogram;
 mod tables;
@@ -45,21 +51,27 @@ impl From<WindowArg> for WindowType {
     }
 }
 
-/// Generate a spectrogram PNG from an audio file (a port of SoX `spectrogram`).
+/// View an audio file's spectrogram (a port of SoX `spectrogram`).
 ///
+/// Opens the GUI viewer by default; pass --output to render a PNG instead.
 /// Decodes any format Symphonia supports (WAV, FLAC, MP3, OGG/Vorbis, AAC,
 /// ALAC, AIFF, CAF, …). At most two of --width, --pixels-per-sec and --duration
 /// may be combined, and only one of --height / --total-height.
 #[derive(Parser, Debug)]
 #[command(name = "rustspek", version, about, long_about = None)]
 struct Args {
-    /// Input audio file (WAV, FLAC, MP3, OGG, AAC, ALAC, …)
+    /// Input audio file (WAV, FLAC, MP3, OGG, AAC, ALAC, …).
+    /// Opens in the GUI viewer by default; pass --output to render a PNG instead.
     #[arg(value_name = "INPUT")]
-    input: PathBuf,
+    input: Option<PathBuf>,
 
-    /// Output PNG file ("-" for stdout)
-    #[arg(short = 'o', long, value_name = "FILE", default_value = "spectrogram.png")]
-    output: String,
+    /// Force the GUI viewer even if --output is given
+    #[arg(long)]
+    gui: bool,
+
+    /// Render a PNG to this file ("-" for stdout) instead of opening the GUI
+    #[arg(short = 'o', long, value_name = "FILE")]
+    output: Option<String>,
 
     // --- Horizontal (time) axis ---
     /// X-axis size in pixels (100-200000); default derived, else 800
@@ -84,6 +96,13 @@ struct Args {
     #[arg(short = 'y', long, value_name = "PX",
           value_parser = clap::value_parser!(i32).range(64..=MAX_Y_SIZE as i64))]
     height: Option<i32>,
+
+    /// FFT window size in points (64-16384; power of two recommended).
+    /// Higher = finer frequency / coarser time resolution.
+    #[arg(short = 'F', long = "fft-size", value_name = "N",
+          conflicts_with_all = ["height", "total_height"],
+          value_parser = clap::value_parser!(i32).range(64..=16384))]
+    fft_size: Option<i32>,
 
     /// Total Y height across all channels (130+); default 550
     #[arg(short = 'Y', long = "total-height", value_name = "PX",
@@ -170,7 +189,9 @@ struct Args {
 fn build_config(args: &Args) -> Result<Config, String> {
     let mut cfg = Config::default();
 
-    cfg.out_name = args.output.clone();
+    if let Some(o) = &args.output {
+        cfg.out_name = o.clone();
+    }
     if let Some(v) = args.width {
         cfg.x_size0 = v;
     }
@@ -187,6 +208,10 @@ fn build_config(args: &Args) -> Result<Config, String> {
     }
     if let Some(v) = args.total_height {
         cfg.big_y_size = v;
+    }
+    if let Some(n) = args.fft_size {
+        // dft_size = 2*(y_size - 1), so y_size = n/2 + 1 yields an n-point FFT.
+        cfg.y_size = n / 2 + 1;
     }
     if let Some(v) = args.db_range {
         cfg.db_range = v;
@@ -227,10 +252,19 @@ fn build_config(args: &Args) -> Result<Config, String> {
 fn run() -> Result<(), String> {
     let args = Args::parse();
 
+    // GUI is the default. Render a PNG (CLI mode) only when an output path is
+    // given and the GUI isn't forced. Without an input there's nothing to
+    // render, so always open the GUI.
+    let render_to_png = args.output.is_some() && !args.gui;
+    if !render_to_png || args.input.is_none() {
+        return gui::run(args.input.clone(), args.fft_size);
+    }
+    let input = args.input.clone().unwrap();
+
     let cfg = build_config(&args)?;
     let out_name = cfg.out_name.clone();
 
-    let audio = audio::read(&args.input).map_err(|e| format!("{}: {e}", args.input.display()))?;
+    let audio = audio::read(&input).map_err(|e| format!("{}: {e}", input.display()))?;
     if audio.frames() == 0 {
         return Err("input file contains no audio samples".into());
     }
@@ -257,7 +291,26 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// Because we're built as a Windows GUI subsystem app, no console is allocated.
+/// When launched from a terminal, attach to that parent console so stdout/stderr
+/// (CLI output, `--help`, errors) are visible. When double-clicked there's no
+/// parent console and this is a harmless no-op — so no console window appears.
+#[cfg(windows)]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn AttachConsole(dw_process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    unsafe {
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    attach_parent_console();
+
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

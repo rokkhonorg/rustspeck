@@ -2,6 +2,8 @@
 //! SoX's `spectrogram.c` (`start`, `make_window`, `flow`, `drain`, `do_column`).
 //! Rendering lives in `render.rs`.
 
+use rayon::prelude::*;
+
 use crate::fft::Dft;
 use crate::timeparse;
 use crate::window::{self, WindowType};
@@ -334,35 +336,41 @@ pub fn process(cfg: Config, rate: f64, channels: u32, samples: &[i32]) -> Result
 
     let geom = compute_geometry(&cfg, rate, channels, total_len)?;
 
-    // One transform plan, built once and reused by every channel (channels are
-    // processed sequentially, so the shared internal buffers are safe to reuse).
-    let mut dft = Dft::new(geom.dft_size as usize);
+    // Channels are fully independent, so process them in parallel. Each task
+    // gets its own FFT plan + work buffers; the output is identical to doing
+    // them sequentially.
+    let per_channel: Vec<ChannelOutput> = (0..chans)
+        .into_par_iter()
+        .map(|ch| {
+            // deinterleave this channel to the [-1, 1) float domain
+            let mut mono = Vec::with_capacity(per_chan_len as usize);
+            let mut f = ch;
+            while f < samples.len() {
+                mono.push(samples[f] as f64 * (1.0 / (0x7FFF_FFFFu32 as f64 + 1.0)));
+                f += chans;
+            }
 
-    let mut dbfs_all: Vec<Vec<f32>> = Vec::with_capacity(chans);
+            let mut dft = Dft::new(geom.dft_size as usize);
+            let mut channel = make_channel(&cfg, &geom, &mut dft);
+            channel.flow(&mono, &cfg);
+            channel.drain(&cfg);
+
+            ChannelOutput {
+                dbfs: channel.dbfs,
+                max: channel.max,
+                cols: channel.cols,
+            }
+        })
+        .collect();
+
     // SoX uses channel 0's max for -n normalisation (autogain = -p->max where p
-    // is flow 0's priv), so we record that channel's max specifically.
-    let mut ch0_max = -(cfg.db_range as f64);
-    let mut cols = 0i32;
-
-    for ch in 0..chans {
-        // deinterleave this channel to float domain
-        let mut mono = Vec::with_capacity(per_chan_len as usize);
-        let mut f = ch;
-        while f < samples.len() {
-            mono.push(samples[f] as f64 * (1.0 / (0x7FFF_FFFFu32 as f64 + 1.0)));
-            f += chans;
-        }
-
-        let mut channel = make_channel(&cfg, &geom, &mut dft);
-        channel.flow(&mono, &cfg);
-        channel.drain(&cfg);
-
-        cols = channel.cols;
-        if ch == 0 {
-            ch0_max = channel.max;
-        }
-        dbfs_all.push(channel.dbfs);
-    }
+    // is flow 0's priv), so we take that channel's max specifically. All channels
+    // produce the same column count.
+    let ch0_max = per_channel
+        .first()
+        .map_or(-(cfg.db_range as f64), |c| c.max);
+    let cols = per_channel.first().map_or(0, |c| c.cols);
+    let dbfs_all: Vec<Vec<f32>> = per_channel.into_iter().map(|c| c.dbfs).collect();
 
     Ok(Spectrogram {
         chans,
@@ -375,6 +383,13 @@ pub fn process(cfg: Config, rate: f64, channels: u32, samples: &[i32]) -> Result
         max: ch0_max,
         cfg,
     })
+}
+
+/// Per-channel analysis result, collected from the parallel pass.
+struct ChannelOutput {
+    dbfs: Vec<f32>,
+    max: f64,
+    cols: i32,
 }
 
 fn compute_geometry(

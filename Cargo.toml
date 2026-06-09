@@ -7,6 +7,16 @@ edition = "2024"
 clap = { version = "4.6.1", features = ["unicode", "derive"] }
 clap_derive = "4.6.1"
 flate2 = "1.1.9"
+floem = { git = "https://github.com/lapce/floem", rev = "bcafaaad3fbf47091e28a64934295194d8e14463", version = "0.2.0" }
+lofty = { version = "0.24.0", features = ["serde"] }
 png = { version = "0.18.1", features = ["zlib-rs"] }
+rayon = "1.12.0"
 rustfft = { version = "6.4.1", features = ["wasm_simd"] }
 symphonia = { version = "0.6.0", features = ["all"] }
+
+[profile.release]
+opt-level = 3       # keep FFT/decode speed; set to "s"/"z" to trade speed for size
+lto = "fat"         # cross-crate dead-code elimination
+codegen-units = 1   # better optimization / smaller output
+panic = "abort"     # drop unwinding tables
+strip = true        # strip symbols
