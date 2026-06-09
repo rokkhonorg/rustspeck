@@ -8,6 +8,7 @@ clap = { version = "4.6.1", features = ["unicode", "derive"] }
 clap_derive = "4.6.1"
 flate2 = "1.1.9"
 floem = { git = "https://github.com/lapce/floem", rev = "bcafaaad3fbf47091e28a64934295194d8e14463", version = "0.2.0" }
+floem_renderer = { git = "https://github.com/lapce/floem", rev = "bcafaaad3fbf47091e28a64934295194d8e14463", version = "0.2.0" }
 lofty = { version = "0.24.0", features = ["serde"] }
 png = { version = "0.18.1", features = ["zlib-rs"] }
 rayon = "1.12.0"

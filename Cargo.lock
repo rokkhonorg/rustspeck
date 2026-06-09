@@ -3349,6 +3349,7 @@ dependencies = [
  "clap_derive",
  "flate2",
  "floem",
+ "floem_renderer",
  "lofty",
  "png 0.18.1",
  "rayon",

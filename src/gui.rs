@@ -8,6 +8,8 @@
 //! are computed reactively from the live size of the heatmap area.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use lofty::file::{FileType, TaggedFileExt};
@@ -16,13 +18,14 @@ use lofty::prelude::{Accessor, AudioFile};
 use floem::action::exec_after;
 use floem::event::listener;
 use floem::ext_event::create_ext_action;
-use floem::kurbo::Size;
-use floem::peniko::Color;
+use floem::kurbo::{Rect, Size};
+use floem::peniko::{Blob, Color, ImageAlphaType, ImageBrush, ImageData, ImageFormat, ImageQuality};
 use floem::reactive::{RwSignal, Scope, SignalGet, SignalUpdate};
 use floem::unit::UnitExt;
-use floem::views::{dyn_view, img, Decorators, Empty, Label, Stack};
+use floem::views::{canvas, dyn_view, img, Decorators, Empty, Label, Stack};
 use floem::window::WindowConfig;
-use floem::{Application, IntoView, View};
+use floem::{Application, IntoView, Renderer, View};
+use floem_renderer::Img;
 
 use crate::audio::{self, Audio};
 use crate::render;
@@ -88,6 +91,43 @@ struct TrackInfo {
     line2: String, // "FLAC · 2 ch · 44.1 kHz · 16-bit · 1024-pt · Hann"
 }
 
+/// One channel's spectrogram as a GPU-uploadable image brush, with a stable
+/// cache key so the renderer uploads the texture once and reuses it.
+#[derive(Clone)]
+struct ChannelTex {
+    brush: ImageBrush,
+    hash: Arc<[u8]>,
+}
+
+static NEXT_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Build one `ImageBrush` per channel directly from raw RGBA (no PNG round-trip).
+fn make_texs(rgbas: Vec<(usize, usize, Vec<u8>)>) -> Vec<ChannelTex> {
+    let gen_id = NEXT_GEN.fetch_add(1, Ordering::Relaxed);
+    rgbas
+        .into_iter()
+        .enumerate()
+        .map(|(k, (w, h, rgba))| {
+            let blob = Blob::new(Arc::new(rgba));
+            let brush = ImageBrush::new(ImageData {
+                data: blob,
+                format: ImageFormat::Rgba8,
+                alpha_type: ImageAlphaType::Alpha,
+                width: w as u32,
+                height: h as u32,
+            })
+            .with_quality(ImageQuality::High);
+            // Stable, unique key: (load generation, channel index).
+            let mut key = gen_id.to_le_bytes().to_vec();
+            key.push(k as u8);
+            ChannelTex {
+                brush,
+                hash: Arc::from(key),
+            }
+        })
+        .collect()
+}
+
 const WIN_W: f64 = 1100.0;
 const WIN_H: f64 = 680.0;
 
@@ -108,7 +148,7 @@ pub fn run(initial: Option<PathBuf>, fft_size: Option<i32>) -> Result<(), String
 /// Build the whole view tree. Must run inside the window closure so its signals
 /// and views are created within floem's runtime scope (otherwise nothing mounts).
 fn build_ui(initial: Option<PathBuf>, fft_size: Option<i32>) -> impl IntoView {
-    let image = RwSignal::new(Vec::<Vec<u8>>::new()); // one PNG per channel
+    let image = RwSignal::new(Vec::<ChannelTex>::new()); // one image brush per channel
     let status = RwSignal::new(PLACEHOLDER.to_string());
     let info = RwSignal::new(TrackInfo::default());
     let meta = RwSignal::new(None::<SpecMeta>);
@@ -123,8 +163,8 @@ fn build_ui(initial: Option<PathBuf>, fft_size: Option<i32>) -> impl IntoView {
 
     if let Some(p) = &initial {
         match analyze(p, fft_size) {
-            Ok((bytes, m, ti)) => {
-                image.set(bytes);
+            Ok((rgbas, m, ti)) => {
+                image.set(make_texs(rgbas));
                 meta.set(Some(m));
                 info.set(ti);
             }
@@ -132,22 +172,33 @@ fn build_ui(initial: Option<PathBuf>, fft_size: Option<i32>) -> impl IntoView {
         }
     }
 
-    // --- Heatmap (centre) — one image per channel, stacked with a real gap ---
+    // --- Heatmap (centre) — a canvas drawing each channel's image into its band.
+    // Drawing the RGBA brushes directly skips the PNG encode/decode round-trip;
+    // the renderer caches each texture by its hash and GPU-scales on resize.
     let centre = dyn_view(move || {
-        let pngs = image.get();
-        if pngs.is_empty() {
+        let texs = image.get();
+        if texs.is_empty() {
             Label::derived(move || status.get())
                 .style(|s| s.size_full().items_center().justify_center().color(LABEL))
                 .into_any()
         } else {
-            // Equal flex bands + row_gap → the gap is window background, not baked
-            // into the texture. min_*(0) so each native texture doesn't impose a
-            // min-content floor; floem GPU-scales each to its band.
-            Stack::vertical_from_iter(pngs.into_iter().map(|p| {
-                img(move || p.clone())
-                    .style(|s| s.flex_grow(1.0).width_full().min_width(0.0).min_height(0.0))
-            }))
-            .style(|s| s.size_full().row_gap(CHANNEL_GAP_PX.pt()))
+            let n = texs.len();
+            canvas(move |cx, size| {
+                let gap = CHANNEL_GAP_PX;
+                let band_h = ((size.height - (n as f64 - 1.0) * gap) / n as f64).max(1.0);
+                for (k, t) in texs.iter().enumerate() {
+                    let top = k as f64 * (band_h + gap);
+                    let rect = Rect::new(0.0, top, size.width, top + band_h);
+                    cx.draw_img(
+                        Img {
+                            img: t.brush.clone(),
+                            hash: &t.hash,
+                        },
+                        rect,
+                    );
+                }
+            })
+            .style(|s| s.size_full())
             .into_any()
         }
     })
@@ -258,7 +309,7 @@ fn centre_area(win_w: f64, win_h: f64) -> (f64, f64) {
 #[allow(clippy::too_many_arguments)]
 fn load_async(
     path: PathBuf,
-    image: RwSignal<Vec<Vec<u8>>>,
+    image: RwSignal<Vec<ChannelTex>>,
     meta: RwSignal<Option<SpecMeta>>,
     info: RwSignal<TrackInfo>,
     status: RwSignal<String>,
@@ -271,10 +322,10 @@ fn load_async(
 
     let send = create_ext_action(
         Scope::current(),
-        move |res: Result<(Vec<Vec<u8>>, SpecMeta, TrackInfo), String>| {
+        move |res: Result<(Vec<(usize, usize, Vec<u8>)>, SpecMeta, TrackInfo), String>| {
             match res {
-                Ok((bytes, m, ti)) => {
-                    image.set(bytes);
+                Ok((rgbas, m, ti)) => {
+                    image.set(make_texs(rgbas));
                     meta.set(Some(m));
                     info.set(ti);
                 }
@@ -290,15 +341,21 @@ fn load_async(
     std::thread::spawn(move || send(analyze(&path, fft_size)));
 }
 
-/// Decode, render per-channel heatmaps, and gather display metadata. Worker.
-fn analyze(path: &Path, fft_size: Option<i32>) -> Result<(Vec<Vec<u8>>, SpecMeta, TrackInfo), String> {
+/// Decode, render per-channel RGBA, and gather display metadata. Worker thread.
+fn analyze(
+    path: &Path,
+    fft_size: Option<i32>,
+) -> Result<(Vec<(usize, usize, Vec<u8>)>, SpecMeta, TrackInfo), String> {
     let audio = audio::read(path)?;
-    let (pngs, meta) = build_image(&audio, fft_size)?;
+    let (rgbas, meta) = build_image(&audio, fft_size)?;
     let info = track_info(path, audio.rate, audio.channels, &meta);
-    Ok((pngs, meta, info))
+    Ok((rgbas, meta, info))
 }
 
-fn build_image(a: &Audio, fft_size: Option<i32>) -> Result<(Vec<Vec<u8>>, SpecMeta), String> {
+fn build_image(
+    a: &Audio,
+    fft_size: Option<i32>,
+) -> Result<(Vec<(usize, usize, Vec<u8>)>, SpecMeta), String> {
     let mut cfg = Config::default();
     cfg.x_size0 = RENDER_COLS;
     match fft_size {
@@ -309,8 +366,8 @@ fn build_image(a: &Audio, fft_size: Option<i32>) -> Result<(Vec<Vec<u8>>, SpecMe
     let cfg = cfg.finalize()?;
     let spec = spectrogram::process(cfg, a.rate, a.channels, &a.samples)?;
     let meta = SpecMeta::from(&spec);
-    let pngs = render::channel_pngs(&spec)?;
-    Ok((pngs, meta))
+    let rgbas = render::channel_images(&spec);
+    Ok((rgbas, meta))
 }
 
 /// Two display rows: "Artist — Title" and a technical summary. Tags/format come

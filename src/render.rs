@@ -431,15 +431,10 @@ fn encode_rgba_png(w: usize, h: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// One PNG (RGBA) per channel, top channel first. The encode runs off the UI
-/// thread, so default compression is fine.
-pub fn channel_pngs(spec: &Spectrogram) -> Result<Vec<Vec<u8>>, String> {
-    (0..spec.chans)
-        .map(|k| {
-            let (w, h, rgba) = channel_rgba(spec, k);
-            encode_rgba_png(w, h, &rgba)
-        })
-        .collect()
+/// Raw RGBA8 per channel (top channel first) as `(width, height, pixels)`.
+/// The GUI uploads these directly to GPU textures (no PNG round-trip).
+pub fn channel_images(spec: &Spectrogram) -> Vec<(usize, usize, Vec<u8>)> {
+    (0..spec.chans).map(|k| channel_rgba(spec, k)).collect()
 }
 
 /// Vertical dBFS colour-scale legend (0 dBFS at top → `-db_range` at bottom)
