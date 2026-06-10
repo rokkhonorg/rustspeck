@@ -485,27 +485,6 @@ impl StreamProcessor {
         &self.channels[ch].dbfs
     }
 
-    /// Consume the processor into a finished [`Spectrogram`]; call after
-    /// [`finish`](Self::finish). Equivalent pixels to the batch [`process`].
-    pub fn into_spectrogram(self) -> Spectrogram {
-        let ch0_max = self
-            .channels
-            .first()
-            .map_or(-(self.cfg.db_range as f64), |c| c.max);
-        let cols = self.channels.first().map_or(0, |c| c.cols);
-        let dbfs_all: Vec<Vec<f32>> = self.channels.into_iter().map(|c| c.dbfs).collect();
-        Spectrogram {
-            chans: self.chans,
-            rows: self.geom.rows,
-            cols,
-            step_size: self.geom.step_size,
-            block_steps: self.geom.block_steps,
-            rate: self.rate,
-            dbfs: dbfs_all,
-            max: ch0_max,
-            cfg: self.cfg,
-        }
-    }
 }
 
 fn compute_geometry(

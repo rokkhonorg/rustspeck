@@ -227,28 +227,9 @@ fn build_ui(initial: Option<PathBuf>, fft_size: Option<i32>) -> impl IntoView {
     // UI sink: the worker thread sends LoadMsgs here; the handler runs on the UI
     // thread and fans each one out to the signals above (which drive the views).
     let sink = make_sink(move |load_gen, msg| {
-        let cur = LOAD_GEN.load(Ordering::SeqCst);
-        match &msg {
-            LoadMsg::Start(n) => eprintln!("[ui] gen{load_gen}/{cur} Start {n}"),
-            LoadMsg::Meta(m, _) => {
-                eprintln!("[ui] gen{load_gen}/{cur} Meta ch={} cols={}", m.channels, m.cols)
-            }
-            LoadMsg::Frame(r) => eprintln!(
-                "[ui] gen{load_gen}/{cur} Frame n={} dim0={:?}",
-                r.len(),
-                r.first().map(|(w, h, _)| (*w, *h))
-            ),
-            LoadMsg::Done(r) => eprintln!(
-                "[ui] gen{load_gen}/{cur} Done n={} dim0={:?}",
-                r.len(),
-                r.first().map(|(w, h, _)| (*w, *h))
-            ),
-            LoadMsg::Err(e) => eprintln!("[ui] gen{load_gen}/{cur} Err {e}"),
-        }
         // Drop messages from a superseded load (a newer file was dropped while
         // this one was still rendering), so only the active load paints.
-        if load_gen != cur {
-            eprintln!("[ui] DROPPED (stale)");
+        if load_gen != LOAD_GEN.load(Ordering::SeqCst) {
             return;
         }
         match msg {
@@ -290,7 +271,6 @@ fn build_ui(initial: Option<PathBuf>, fft_size: Option<i32>) -> impl IntoView {
         } else {
             let n = texs.len();
             canvas(move |cx, size| {
-                eprintln!("[canvas] n={n} size={}x{}", size.width, size.height);
                 let gap = CHANNEL_GAP_PX;
                 let band_h = ((size.height - (n as f64 - 1.0) * gap) / n as f64).max(1.0);
                 for (k, t) in texs.iter().enumerate() {
@@ -519,9 +499,15 @@ fn worker(
     }
     proc.finish();
 
-    // Final, exact image (matches the batch/CLI render pixel-for-pixel).
-    let spec = proc.into_spectrogram();
-    sink(LoadMsg::Done(render::channel_images(&spec)));
+    // Final image, rendered at the full target width (x_size) — the SAME
+    // dimensions as the streaming frames — so the renderer recycles those
+    // textures in place. Rendering at the exact column count (which can be a
+    // pixel short of x_size when the audio doesn't land exactly on a column
+    // boundary) would be a different size, defeating region reuse: on a full
+    // atlas the final frame then fails to pack and the spectrogram blanks.
+    // With normalize off (the GUI default) this is identical data to the batch
+    // render, just padded with the trailing background column.
+    sink(LoadMsg::Done(render::stream_channel_images(&proc)));
     Ok(())
 }
 
