@@ -38,6 +38,10 @@ symphonia = { version = "0.6.0", default-features = false, features = [
     "alac",
 ] }
 
+[[bench]]
+name = "fft_compare"
+harness = false     # plain main(); no libtest/criterion harness
+
 [profile.release]
 opt-level = "s"     # optimize for size; hot crates overridden to opt-level 3 below
 lto = "fat"         # cross-crate dead-code elimination
