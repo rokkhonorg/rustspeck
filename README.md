@@ -16,6 +16,16 @@ cargo build --release
 # binary at target/release/rustspeck
 ```
 
+### FFmpeg fallback (optional, runtime)
+
+Decoding is handled by [Symphonia](https://github.com/pdeljanov/Symphonia)
+(pure Rust). For the occasional container/codec Symphonia doesn't support (e.g.
+Opus, WavPack), RustSpeck automatically falls back to the system **`ffmpeg`**
+binary if it's found on `PATH` — no build flag and no FFmpeg libraries required,
+just the regular `ffmpeg`/`ffprobe` executables installed (e.g. `winget install
+Gyan.FFmpeg`, `brew install ffmpeg`, `apt install ffmpeg`). If `ffmpeg` isn't
+installed, an unsupported file simply reports the Symphonia error with a hint.
+
 ## GUI viewer (default)
 
 Open a file in the interactive viewer — just pass an input (or launch with no
