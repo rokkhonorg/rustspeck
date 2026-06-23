@@ -210,6 +210,9 @@ struct Channel {
     dft_buf: Vec<f64>,
     magnitudes: Vec<f64>,
     dbfs: Vec<f32>,
+    /// Reusable deinterleave scratch for the streaming `push` path, kept on the
+    /// channel so it isn't reallocated per chunk. Unused by the batch path.
+    mono_buf: Vec<f64>,
     win: WindowState,
     gain_val: f64,
 
@@ -436,12 +439,18 @@ impl StreamProcessor {
         let chans = self.chans;
         let cfg = &self.cfg;
         self.channels.par_iter_mut().enumerate().for_each(|(ch, c)| {
-            let mono: Vec<f64> = interleaved[ch..]
-                .iter()
-                .step_by(chans)
-                .map(|&s| s as f64 * SAMPLE_SCALE)
-                .collect();
+            // Reuse the channel's scratch buffer to avoid a heap allocation per
+            // chunk. Take it out so `flow` can borrow `c` mutably, then restore.
+            let mut mono = std::mem::take(&mut c.mono_buf);
+            mono.clear();
+            mono.extend(
+                interleaved[ch..]
+                    .iter()
+                    .step_by(chans)
+                    .map(|&s| s as f64 * SAMPLE_SCALE),
+            );
             c.flow(&mono, cfg);
+            c.mono_buf = mono;
         });
     }
 
@@ -614,6 +623,7 @@ fn make_channel(cfg: &Config, geom: &Geometry, dft: Dft) -> Channel {
         dft_buf: vec![0.0; dft_size as usize],
         magnitudes: vec![0.0; ((dft_size >> 1) + 1) as usize],
         dbfs: Vec::new(),
+        mono_buf: Vec::new(),
         win,
         gain_val: cfg.gain as f64,
         dft,

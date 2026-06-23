@@ -383,14 +383,14 @@ pub fn render_png<W: Write>(spec: &Spectrogram, mut out: W) -> Result<(), String
     Ok(())
 }
 
-/// Build one channel's heatmap (cols × rows, high frequency at top) as an RGBA8
-/// top-down buffer. Each channel is a separate image so the GUI can lay them out
+/// Build one channel's heatmap (cols × rows, high frequency at top) as a top-down
+/// BGRA8 buffer. Each channel is a separate image so the GUI can lay them out
 /// with a real background gap between them rather than baking it into one image.
-fn channel_rgba(spec: &Spectrogram, k: usize) -> (usize, usize, Vec<u8>) {
+fn channel_bgra(spec: &Spectrogram, k: usize, palette: &[u8]) -> (usize, usize, Vec<u8>) {
     let cfg = &spec.cfg;
     let autogain = if cfg.normalize { -spec.max } else { 0.0 };
     let tex_rows = gui_tex_rows(spec.rows, spec.chans);
-    dbfs_to_rgba(cfg, &spec.dbfs[k], spec.rows, spec.cols, spec.cols, tex_rows, autogain)
+    dbfs_to_bgra(cfg, &spec.dbfs[k], spec.rows, spec.cols, spec.cols, tex_rows, autogain, palette)
 }
 
 /// Per-channel texture height for the GUI. We keep full frequency resolution in
@@ -409,12 +409,16 @@ fn gui_tex_rows(rows: i32, chans: usize) -> i32 {
     rows.min(cap)
 }
 
-/// Colour one channel's dBfs columns into a top-down RGBA8 buffer of width
-/// `total_cols × rows` (high frequency at top). Columns `0..cols_filled` are
-/// taken from `dbfs` (column-major: `dbfs[col*rows + row]`); any remaining
-/// columns up to `total_cols` are left as the background palette colour, which
-/// is how the GUI grows the image left-to-right while a file streams in.
-pub fn dbfs_to_rgba(
+/// Colour one channel's dBfs columns into a top-down **BGRA8** buffer of width
+/// `total_cols × rows` (high frequency at top), ready for direct GPU upload
+/// (gpui's `RenderImage` stores BGRA, so we emit that byte order here rather than
+/// swapping in a second pass on the UI thread). `palette` is the precomputed RGB
+/// palette ([`make_palette`]); the caller passes it in so it isn't rebuilt per
+/// channel/frame. Columns `0..cols_filled` are taken from `dbfs` (column-major:
+/// `dbfs[col*rows + row]`); any remaining columns up to `total_cols` are left as
+/// the background colour, which is how the GUI grows the image left-to-right
+/// while a file streams in.
+pub fn dbfs_to_bgra(
     cfg: &Config,
     dbfs: &[f32],
     rows: i32,
@@ -422,18 +426,19 @@ pub fn dbfs_to_rgba(
     total_cols: i32,
     tex_rows: i32,
     autogain: f64,
+    palette: &[u8],
 ) -> (usize, usize, Vec<u8>) {
     let w = total_cols.max(1) as usize;
     // Output texture height; never upsample past the real row count. When
     // `tex_rows == rows` this is an exact 1:1 copy (the mapping below reduces to
     // `j = rows - 1 - r`); when smaller, frequency bins are nearest-sampled.
     let h = tex_rows.clamp(1, rows.max(1)) as usize;
-    let palette = make_palette(cfg);
-    let bg = [palette[0], palette[1], palette[2]];
+    // Background colour in BGRA byte order.
+    let bg = [palette[2], palette[1], palette[0]];
 
-    let mut rgba = vec![0u8; w * h * 4];
+    let mut buf = vec![0u8; w * h * 4];
     // Background fill first (covers the not-yet-computed columns).
-    for px in rgba.chunks_exact_mut(4) {
+    for px in buf.chunks_exact_mut(4) {
         px[0] = bg[0];
         px[1] = bg[1];
         px[2] = bg[2];
@@ -455,12 +460,12 @@ pub fn dbfs_to_rgba(
             let v = dbfs[(i * rows + j) as usize] as f64 + autogain;
             let idx = colour(cfg, v) as usize * 3;
             let o = ro + i as usize * 4;
-            rgba[o] = palette[idx];
-            rgba[o + 1] = palette[idx + 1];
-            rgba[o + 2] = palette[idx + 2];
+            buf[o] = palette[idx + 2]; // B
+            buf[o + 1] = palette[idx + 1]; // G
+            buf[o + 2] = palette[idx]; // R
         }
     }
-    (w, h, rgba)
+    (w, h, buf)
 }
 
 fn encode_rgba_png(w: usize, h: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
@@ -479,25 +484,29 @@ fn encode_rgba_png(w: usize, h: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-/// Raw RGBA8 per channel (top channel first) as `(width, height, pixels)`.
-/// The GUI uploads these directly to GPU textures (no PNG round-trip).
+/// Raw BGRA8 per channel (top channel first) as `(width, height, pixels)`. The
+/// GUI uploads these directly to GPU textures (no PNG round-trip). The palette is
+/// built once here and shared across channels.
 pub fn channel_images(spec: &Spectrogram) -> Vec<(usize, usize, Vec<u8>)> {
-    (0..spec.chans).map(|k| channel_rgba(spec, k)).collect()
+    let palette = make_palette(&spec.cfg);
+    (0..spec.chans).map(|k| channel_bgra(spec, k, &palette)).collect()
 }
 
-/// Per-channel partial RGBA snapshot from a streaming processor: each image is
+/// Per-channel partial BGRA snapshot from a streaming processor: each image is
 /// the full target width (`x_size`), with only the columns produced so far
 /// painted and the rest left as background. Normalisation is intentionally not
 /// applied here (the global max isn't known mid-stream); the GUI uses the
-/// default, non-normalised config.
+/// default, non-normalised config. The palette is built once and shared across
+/// channels (it's constant for a given config).
 pub fn stream_channel_images(proc: &StreamProcessor) -> Vec<(usize, usize, Vec<u8>)> {
     let cfg = proc.cfg();
     let rows = proc.rows();
     let total = proc.x_size();
     let filled = proc.cols_done();
     let tex_rows = gui_tex_rows(rows, proc.chans());
+    let palette = make_palette(cfg);
     (0..proc.chans())
-        .map(|k| dbfs_to_rgba(cfg, proc.channel_dbfs(k), rows, filled, total, tex_rows, 0.0))
+        .map(|k| dbfs_to_bgra(cfg, proc.channel_dbfs(k), rows, filled, total, tex_rows, 0.0, &palette))
         .collect()
 }
 

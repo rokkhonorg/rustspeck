@@ -125,19 +125,17 @@ fn is_current(my_gen: u64) -> bool {
     LOAD_GEN.load(Ordering::SeqCst) == my_gen
 }
 
-/// Build one `Arc<RenderImage>` per channel directly from raw RGBA (no PNG
-/// round-trip). gpui's `RenderImage` stores BGRA, so we swap R↔B in place. A
-/// fresh `RenderImage` (hence a fresh GPU texture id) is created per call, which
-/// is what lets a streaming load replace the previous frame's texture.
-fn make_images(rgbas: Vec<(usize, usize, Vec<u8>)>) -> Vec<Arc<RenderImage>> {
-    rgbas
+/// Build one `Arc<RenderImage>` per channel from raw BGRA buffers — the byte
+/// order gpui's `RenderImage` stores. The renderer (`render::*_images`) already
+/// emits BGRA, so there's no per-frame channel swap here. A fresh `RenderImage`
+/// (hence a fresh GPU texture id) is created per call, which is what lets a
+/// streaming load replace the previous frame's texture.
+fn make_images(buffers: Vec<(usize, usize, Vec<u8>)>) -> Vec<Arc<RenderImage>> {
+    buffers
         .into_iter()
-        .map(|(w, h, mut rgba)| {
-            for px4 in rgba.chunks_exact_mut(4) {
-                px4.swap(0, 2); // RGBA -> BGRA
-            }
-            let buf = RgbaImage::from_raw(w as u32, h as u32, rgba)
-                .expect("rgba buffer length must equal w*h*4");
+        .map(|(w, h, bgra)| {
+            let buf = RgbaImage::from_raw(w as u32, h as u32, bgra)
+                .expect("bgra buffer length must equal w*h*4");
             let frame = Frame::new(buf);
             let frames: SmallVec<[Frame; 1]> = SmallVec::from_buf([frame]);
             Arc::new(RenderImage::new(frames))
@@ -465,18 +463,22 @@ pub fn run(initial: Option<PathBuf>, fft_size: Option<i32>) -> Result<(), String
 }
 
 /// Build the dBFS colour-scale gradient bar as a single GPU image. The shared
-/// renderer emits it as a PNG (same bytes the CLI/floem build use); we decode it
-/// once at startup, so `render.rs` stays identical across both GUI branches.
+/// renderer emits it as an RGBA PNG; we decode it once at startup and swap to
+/// BGRA (unlike the channel images, which the renderer already emits as BGRA).
 fn make_legend() -> Arc<RenderImage> {
     let png = render::legend_png(120).unwrap_or_default();
-    let (w, h, rgba) = match image::load_from_memory(&png) {
+    let (w, h, mut bgra) = match image::load_from_memory(&png) {
         Ok(decoded) => {
             let buf = decoded.to_rgba8();
             (buf.width() as usize, buf.height() as usize, buf.into_raw())
         }
         Err(_) => (1, 1, vec![0, 0, 0, 0xff]),
     };
-    make_images(vec![(w, h, rgba)])
+    // legend_png is RGBA; RenderImage wants BGRA. One-time swap at startup.
+    for px in bgra.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    make_images(vec![(w, h, bgra)])
         .pop()
         .expect("one legend image")
 }
