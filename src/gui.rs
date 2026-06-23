@@ -491,9 +491,14 @@ fn centre_area(win_w: f64, win_h: f64) -> (f64, f64) {
     )
 }
 
-/// Publish a progressive frame at most ~16×/sec, and only when new columns have
-/// actually appeared since the last one.
-const PUBLISH_INTERVAL: Duration = Duration::from_millis(60);
+/// Target progressive-render rate while a file streams in. gpui repaints on
+/// demand (and the platform vsync-caps to the display), so this just bounds how
+/// often the worker pushes a new snapshot to the UI.
+const TARGET_FPS: u64 = 10;
+
+/// Publish a progressive frame at most `TARGET_FPS`×/sec, and only
+/// when new columns have actually appeared since the last one.
+const PUBLISH_INTERVAL: Duration = Duration::from_micros(1_000_000 / TARGET_FPS);
 
 /// Decode `path` and feed the spectrogram incrementally, emitting progressive
 /// frames as columns are produced. When the container doesn't report a length,
