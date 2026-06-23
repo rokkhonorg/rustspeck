@@ -1,4 +1,5 @@
 // Auto-extracted verbatim from sox-code/src/spectrogram.c
+// Copyright (c) 2008-2009 robs@users.sourceforge.net — LGPL-2.1-or-later.
 
 pub static ALT_PALETTE: [u8; 504] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x05, 0x00, 0x01, 0x08,

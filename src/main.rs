@@ -1,22 +1,14 @@
-//! rustspeck — a Rust port of SoX's `spectrogram` effect.
+//! rustspeck — an audio spectrogram renderer and viewer.
 //!
-//! Produces a PNG spectrogram bit-compatible with
-//! `sox <in> -n spectrogram [options]`, with a friendlier CLI. Input decoding is
-//! handled by Symphonia, so any format it supports works (WAV, FLAC, MP3, …).
+//! Produces PNG spectrograms bit-compatible with `sox <in> -n spectrogram
+//! [options]` (the DSP it grew from), with a friendlier CLI and a GUI viewer.
+//! Input decoding is handled by Symphonia, so any format it supports works
+//! (WAV, FLAC, MP3, …).
 
 // Build as a GUI (no console window pops up on launch). We reattach to the
 // parent console at startup (see `attach_parent_console`) so CLI use from a
 // terminal still prints normally.
 #![cfg_attr(windows, windows_subsystem = "windows")]
-
-mod audio;
-mod fft;
-mod gui;
-mod render;
-mod spectrogram;
-mod tables;
-mod timeparse;
-mod window;
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -25,8 +17,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 
-use spectrogram::{Config, MAX_X_SIZE, MAX_Y_SIZE};
-use window::WindowType;
+use rustspeck::spectrogram::{self, Config, MAX_X_SIZE, MAX_Y_SIZE};
+use rustspeck::window::WindowType;
+use rustspeck::{audio, render};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum WindowArg {
@@ -257,7 +250,14 @@ fn run() -> Result<(), String> {
     // render, so always open the GUI.
     let render_to_png = args.output.is_some() && !args.gui;
     if !render_to_png || args.input.is_none() {
-        return gui::run(args.input.clone(), args.fft_size);
+        #[cfg(feature = "gui")]
+        return rustspeck::gui::run(args.input.clone(), args.fft_size);
+        #[cfg(not(feature = "gui"))]
+        return Err(
+            "this build has no GUI viewer (built without the `gui` feature); \
+             pass --output <FILE> to render a PNG instead"
+                .into(),
+        );
     }
     let input = args.input.clone().unwrap();
 

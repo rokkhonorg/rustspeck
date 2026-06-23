@@ -1,6 +1,9 @@
 //! Core spectrogram DSP — a faithful port of the signal-processing half of
 //! SoX's `spectrogram.c` (`start`, `make_window`, `flow`, `drain`, `do_column`).
 //! Rendering lives in `render.rs`.
+//!
+//! Derived from SoX's `spectrogram.c`,
+//! Copyright (c) 2008-2009 robs@users.sourceforge.net — LGPL-2.1-or-later.
 
 use rayon::prelude::*;
 

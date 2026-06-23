@@ -2,20 +2,35 @@
 name = "rustspeck"
 version = "0.1.0"
 edition = "2024"
+description = "Audio spectrogram renderer, viewer, and library — PNG/RGBA output via CLI or an optional gpui GUI, with SoX-compatible results."
+repository = "https://github.com/rokkhonorg/rustspeck"
+readme = "README.md"
+# Derived from SoX's spectrogram effect (LGPL-2.1-or-later); see LICENSE. A port
+# of LGPL source is a derivative work, so the crate carries the same license.
+license = "LGPL-2.1-or-later"
+
+[features]
+default = ["gui"]
+# The interactive GUI viewer. Pulls in gpui (Zed's GUI framework), an async
+# channel for the worker->UI bridge, and lofty for track-metadata display.
+# Library consumers that only want image output can `default-features = false`
+# to drop this whole tree.
+gui = ["dep:gpui", "dep:async-channel", "dep:lofty"]
 
 [dependencies]
-async-channel = "2.5"
 clap = { version = "4.6.1", features = ["unicode", "derive"] }
 clap_derive = "4.6.1"
 flate2 = "1.1.9"
-# GUI backend (gpui-port branch): Zed's gpui instead of floem. The whole viewer
-# (src/gui.rs) is ported to gpui's element/entity model; everything else — audio
-# decode, spectrogram DSP and the RGBA/PNG rendering — is framework-agnostic and
-# unchanged, so the two branches are directly comparable for GUI performance.
-gpui = "0.2"
 image = "0.25"
-lofty = { version = "0.24.0", features = ["serde"] }
 png = { version = "0.18.1", features = ["zlib-rs"] }
+
+# --- GUI-only (optional; enabled by the `gui` feature) ---
+# Zed's gpui instead of floem. The whole viewer (src/gui.rs) is ported to gpui's
+# element/entity model; everything else — audio decode, spectrogram DSP and the
+# RGBA/PNG rendering — is framework-agnostic, so the library builds without it.
+gpui = { version = "0.2", optional = true }
+async-channel = { version = "2.5", optional = true }
+lofty = { version = "0.24.0", features = ["serde"], optional = true }
 rayon = "1.12.0"
 realfft = "3"
 smallvec = "1"

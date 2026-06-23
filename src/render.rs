@@ -298,7 +298,12 @@ fn pad_left(s: &str, width: usize) -> String {
     }
 }
 
-pub fn render_png<W: Write>(spec: &Spectrogram, mut out: W) -> Result<(), String> {
+/// Compose the full spectrogram image (bands + axes/legend, or just the bands in
+/// `raw` mode) into an **indexed** buffer in PNG row order (top = highest
+/// frequency) plus its RGB `palette`. Both the PNG and RGBA renderers build on
+/// this, so they always produce pixel-identical output. Returns
+/// `(cols, rows, indices, palette)`.
+fn compose_indexed(spec: &Spectrogram) -> Result<(u32, u32, Vec<u8>, Vec<u8>), String> {
     let cfg = &spec.cfg;
     let chans = spec.chans as i32;
     let p_rows = spec.rows;
@@ -358,7 +363,7 @@ pub fn render_png<W: Write>(spec: &Spectrogram, mut out: W) -> Result<(), String
         draw_legends(&mut img, spec, cfg, c_rows, tick_len, autogain);
     }
 
-    // --- Encode PNG (flip rows: PNG top = highest y) ---
+    // Flip rows so PNG top = highest y (top-down order).
     let mut top_down = vec![0u8; (cols * rows) as usize];
     for y in 0..rows {
         let src = (y * cols) as usize;
@@ -366,9 +371,15 @@ pub fn render_png<W: Write>(spec: &Spectrogram, mut out: W) -> Result<(), String
         top_down[dst..dst + cols as usize].copy_from_slice(&img.pixels[src..src + cols as usize]);
     }
 
+    Ok((cols as u32, rows as u32, top_down, palette))
+}
+
+pub fn render_png<W: Write>(spec: &Spectrogram, mut out: W) -> Result<(), String> {
+    let (cols, rows, top_down, palette) = compose_indexed(spec)?;
+
     let mut buf = Vec::new();
     {
-        let mut encoder = png::Encoder::new(&mut buf, cols as u32, rows as u32);
+        let mut encoder = png::Encoder::new(&mut buf, cols, rows);
         encoder.set_color(png::ColorType::Indexed);
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_palette(palette);
@@ -381,6 +392,25 @@ pub fn render_png<W: Write>(spec: &Spectrogram, mut out: W) -> Result<(), String
     }
     out.write_all(&buf).map_err(|e| format!("write error: {e}"))?;
     Ok(())
+}
+
+/// Render the spectrogram to an [`image::RgbaImage`] — the same pixels as
+/// [`render_png`], expanded from the indexed palette into straight RGBA8 (opaque
+/// alpha). Handy when a caller wants the decoded image to resize, composite or
+/// hand to another image pipeline rather than encoded PNG bytes.
+pub fn render_rgba(spec: &Spectrogram) -> Result<image::RgbaImage, String> {
+    let (cols, rows, indices, palette) = compose_indexed(spec)?;
+
+    let mut rgba = vec![0u8; indices.len() * 4];
+    for (px, &idx) in rgba.chunks_exact_mut(4).zip(indices.iter()) {
+        let p = idx as usize * 3;
+        px[0] = palette[p];
+        px[1] = palette[p + 1];
+        px[2] = palette[p + 2];
+        px[3] = 255;
+    }
+    image::RgbaImage::from_raw(cols, rows, rgba)
+        .ok_or_else(|| "internal error: RGBA buffer size mismatch".to_string())
 }
 
 /// Build one channel's heatmap (cols × rows, high frequency at top) as a top-down
