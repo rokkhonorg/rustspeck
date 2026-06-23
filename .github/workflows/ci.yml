@@ -1,12 +1,14 @@
 name: CI
 
-# Build + test on every pushed commit (except tag pushes, which the release
-# workflow handles) and on pull requests, uploading the built binary as a
-# workflow artifact for each platform.
+# Build + test on every pushed commit (to any branch; tag pushes are handled by
+# the release workflow) and on pull requests, uploading the built binary as a
+# workflow artifact for each platform. Also runnable on demand from the Actions
+# tab via workflow_dispatch.
 on:
   push:
-    tags-ignore: ["**"]
+    branches: ["**"]
   pull_request:
+  workflow_dispatch:
 
 # Cancel an in-progress run when the same ref is pushed again.
 concurrency:
