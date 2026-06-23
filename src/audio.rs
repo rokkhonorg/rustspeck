@@ -332,7 +332,7 @@ mod ffmpeg_decode {
 
         // Raw interleaved s32le at the native rate/layout (no -ar/-ac), straight
         // to stdout. `-v error` keeps stderr to genuine errors only.
-        let out = Command::new("ffmpeg")
+        let out = command("ffmpeg")
             .args(["-v", "error", "-nostdin", "-i"])
             .arg(path)
             .args(["-map", "a:0", "-f", "s32le", "-c:a", "pcm_s32le", "-"])
@@ -365,7 +365,7 @@ mod ffmpeg_decode {
 
     /// Read the first audio stream's sample rate and channel count via `ffprobe`.
     fn probe(path: &Path) -> Result<(u32, u32), Error> {
-        let out = Command::new("ffprobe")
+        let out = command("ffprobe")
             .args([
                 "-v",
                 "error",
@@ -412,6 +412,21 @@ mod ffmpeg_decode {
         } else {
             Error::Failed(format!("could not run ffmpeg: {e}"))
         }
+    }
+
+    /// A `Command` for `bin` that doesn't pop a console window. RustSpeck is built
+    /// as a Windows GUI-subsystem app (no console of its own), so a spawned
+    /// console subprocess would otherwise flash a window for each call.
+    fn command(bin: &str) -> Command {
+        #[allow(unused_mut)]
+        let mut cmd = Command::new(bin);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd
     }
 }
 
