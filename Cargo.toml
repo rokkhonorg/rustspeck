@@ -1,6 +1,6 @@
 [package]
 name = "rustspeck"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Audio spectrogram renderer, viewer, and library — PNG/RGBA output via CLI or an optional gpui GUI, with SoX-compatible results."
 repository = "https://github.com/rokkhonorg/rustspeck"
