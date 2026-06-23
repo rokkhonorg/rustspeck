@@ -17,6 +17,7 @@ image = "0.25"
 lofty = { version = "0.24.0", features = ["serde"] }
 png = { version = "0.18.1", features = ["zlib-rs"] }
 rayon = "1.12.0"
+realfft = "3"
 smallvec = "1"
 rustfft = { version = "6.4.1", features = ["wasm_simd"] }
 # Trimmed from "all": dropped Matroska (mkv), CAF, and MP1/MP2 to shrink the
@@ -45,11 +46,15 @@ panic = "abort"     # drop unwinding tables
 strip = true        # strip symbols
 
 # Keep the spectrogram hot path fully speed-optimized even though the rest of
-# the binary is built for size: the FFT kernels (rustfft) and our own DSP loops
-# (window multiply, power-spectrum accumulation, dBfs mapping). Both are small in
-# the binary, so pinning them to opt-level 3 costs little size but avoids a large
-# slowdown on big FFTs.
+# the binary is built for size: the FFT kernels (rustfft), the real-FFT
+# recombination layer (realfft) and our own DSP loops (window multiply,
+# power-spectrum accumulation, dBfs mapping). All are small in the binary, so
+# pinning them to opt-level 3 costs little size but avoids a large slowdown on
+# big FFTs.
 [profile.release.package.rustfft]
+opt-level = 3
+
+[profile.release.package.realfft]
 opt-level = 3
 
 [profile.release.package.rustspeck]

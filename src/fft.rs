@@ -1,38 +1,50 @@
-//! Forward DFT power spectrum, backed by `rustfft`.
+//! Forward DFT power spectrum, backed by `realfft` (a real-input FFT layer over
+//! `rustfft`).
 //!
 //! SoX's `spectrogram.c` only ever needs the *power spectrum* of a windowed
 //! real frame (`|X[k]|^2` for `k` in `0..=n/2`), accumulated across the blocks
 //! that make up one output column. The original C used Ooura's `fft4g` for
-//! power-of-2 sizes and a slow O(n^2) DFT otherwise; `rustfft` is a fast
-//! mixed-radix implementation that handles *any* size, so it replaces both.
+//! power-of-2 sizes and a slow O(n^2) DFT otherwise.
+//!
+//! Because the input is real, the spectrum is conjugate-symmetric and the upper
+//! half is redundant — we already only read bins `0..=n/2`. So instead of a full
+//! length-`n` complex FFT with a zero imaginary part, we use a real-to-complex
+//! transform, which computes those `n/2+1` bins via a length-`n/2` complex FFT
+//! plus an O(n) recombination — roughly half the work and memory. The output is
+//! the same DFT bins (within floating-point tolerance), so the spectrogram is
+//! unchanged.
 //!
 //! Note: results match the C to within normal floating-point tolerance rather
-//! than bit-for-bit — `rustfft` uses a different algorithm and operation order.
+//! than bit-for-bit — the FFT uses a different algorithm and operation order.
 
 use std::sync::Arc;
 
-use rustfft::num_complex::Complex;
-use rustfft::{Fft, FftPlanner};
+use realfft::num_complex::Complex;
+use realfft::{RealFftPlanner, RealToComplex};
 
-/// Forward DFT for a fixed transform length. Build once per length and reuse;
-/// the internal buffers are reused across calls.
+/// Forward real-input DFT for a fixed transform length. Build once per length
+/// and reuse; the internal buffers are reused across calls.
 pub struct Dft {
     n: usize,
-    fft: Arc<dyn Fft<f64>>,
-    buf: Vec<Complex<f64>>,
+    r2c: Arc<dyn RealToComplex<f64>>,
+    input: Vec<f64>,            // length n (overwritten each call)
+    spectrum: Vec<Complex<f64>>, // length n/2 + 1
     scratch: Vec<Complex<f64>>,
 }
 
 impl Dft {
     pub fn new(n: usize) -> Self {
         assert!(n >= 2, "DFT length must be >= 2");
-        let mut planner = FftPlanner::<f64>::new();
-        let fft = planner.plan_fft_forward(n);
-        let scratch = vec![Complex::new(0.0, 0.0); fft.get_inplace_scratch_len()];
+        let mut planner = RealFftPlanner::<f64>::new();
+        let r2c = planner.plan_fft_forward(n);
+        let input = r2c.make_input_vec(); // length n
+        let spectrum = r2c.make_output_vec(); // length n/2 + 1
+        let scratch = r2c.make_scratch_vec();
         Dft {
             n,
-            fft,
-            buf: vec![Complex::new(0.0, 0.0); n],
+            r2c,
+            input,
+            spectrum,
             scratch,
         }
     }
@@ -44,14 +56,14 @@ impl Dft {
         debug_assert_eq!(input.len(), self.n);
         debug_assert!(out.len() >= self.n / 2 + 1);
 
-        for (slot, &x) in self.buf.iter_mut().zip(input) {
-            slot.re = x;
-            slot.im = 0.0;
-        }
-        self.fft.process_with_scratch(&mut self.buf, &mut self.scratch);
+        // realfft consumes (overwrites) its input buffer, so transform a copy and
+        // leave the caller's slice intact.
+        self.input.copy_from_slice(input);
+        self.r2c
+            .process_with_scratch(&mut self.input, &mut self.spectrum, &mut self.scratch)
+            .expect("realfft: buffer sizes are fixed at construction");
 
-        for (k, o) in out.iter_mut().enumerate().take(self.n / 2 + 1) {
-            let c = self.buf[k];
+        for (o, c) in out.iter_mut().zip(self.spectrum.iter()).take(self.n / 2 + 1) {
             *o += c.re * c.re + c.im * c.im;
         }
     }
