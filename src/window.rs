@@ -3,7 +3,7 @@
 
 use std::f64::consts::PI;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::EnumIter)]
 pub enum WindowType {
     Hann,
     Hamming,

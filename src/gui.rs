@@ -25,15 +25,17 @@ use lofty::prelude::{Accessor, AudioFile};
 use gpui::prelude::*;
 use gpui::{
     canvas, div, img, point, px, rgb, size, App, Application, AsyncApp, Bounds, Context, Corners,
-    Div, ExternalPaths, ObjectFit, Pixels, Render, RenderImage, SharedString, TitlebarOptions,
-    Window, WindowBounds, WindowOptions,
+    Div, ExternalPaths, FocusHandle, KeyDownEvent, ObjectFit, Pixels, Render, RenderImage,
+    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use image::{Frame, RgbaImage};
 use smallvec::SmallVec;
+use strum::IntoEnumIterator;
 
 use crate::audio::{self, Audio};
 use crate::render;
 use crate::spectrogram::{self, Config, StreamProcessor};
+use crate::window::WindowType;
 
 const FONT: &str = "JetBrains Mono";
 const PLACEHOLDER: &str = "Drag and drop an audio file.";
@@ -73,6 +75,46 @@ const WIN_H: f64 = 680.0;
 #[inline]
 fn p(x: f64) -> Pixels {
     px(x as f32)
+}
+
+/// The analysis parameters the user can cycle live from the keyboard. `Copy` so
+/// the worker thread can take it by value.
+#[derive(Clone, Copy)]
+struct Analysis {
+    /// FFT size override (DFT points). `None` = derive height automatically.
+    fft_size: Option<i32>,
+    win_type: WindowType,
+}
+
+/// FFT sizes the `f` / `Shift+F` keys cycle through (powers of two, 128 … 16384).
+const FFT_SIZES: [i32; 8] = [128, 256, 512, 1024, 2048, 4096, 8192, 16384];
+
+/// Smallest cycle size strictly larger than `cur` (the `f` step). Because it's
+/// relative to the current size, the first press steps up from whatever the
+/// automatic geometry chose rather than jumping to the bottom. Wraps to the
+/// smallest size once past the largest.
+fn fft_up(cur: i32) -> i32 {
+    FFT_SIZES.iter().copied().find(|&s| s > cur).unwrap_or(FFT_SIZES[0])
+}
+
+/// Largest cycle size strictly smaller than `cur` (the `Shift+F` step). Wraps to
+/// the largest size once below the smallest.
+fn fft_down(cur: i32) -> i32 {
+    FFT_SIZES
+        .iter()
+        .copied()
+        .rev()
+        .find(|&s| s < cur)
+        .unwrap_or(FFT_SIZES[FFT_SIZES.len() - 1])
+}
+
+/// Next window function in the cycle (`strum::EnumIter`, wrapping around).
+fn next_window(current: WindowType) -> WindowType {
+    WindowType::iter()
+        .cycle()
+        .skip_while(|&w| w != current)
+        .nth(1)
+        .expect("EnumIter is non-empty")
 }
 
 /// Metadata needed to draw the axes (everything is Copy, so it's Send for the
@@ -164,7 +206,9 @@ type Sender = async_channel::Sender<(u64, LoadMsg)>;
 /// The root view: holds all the state the previous floem build kept in signals.
 struct SpekApp {
     tx: Sender,
-    fft_size: Option<i32>,
+    analysis: Analysis,
+    path: Option<PathBuf>, // the current track, kept so f/w can re-analyse it
+    focus_handle: FocusHandle, // so the root element receives key events
     images: Vec<Arc<RenderImage>>, // one image per channel
     status: SharedString,
     info: TrackInfo,
@@ -173,10 +217,20 @@ struct SpekApp {
 }
 
 impl SpekApp {
-    fn new(tx: Sender, legend: Arc<RenderImage>, fft_size: Option<i32>) -> Self {
+    fn new(
+        tx: Sender,
+        legend: Arc<RenderImage>,
+        fft_size: Option<i32>,
+        focus_handle: FocusHandle,
+    ) -> Self {
         SpekApp {
             tx,
-            fft_size,
+            analysis: Analysis {
+                fft_size,
+                win_type: WindowType::Hann,
+            },
+            path: None,
+            focus_handle,
             images: Vec::new(),
             status: SharedString::from(PLACEHOLDER),
             info: TrackInfo::default(),
@@ -189,20 +243,58 @@ impl SpekApp {
     /// spectrogram to the UI through the channel. Claims a new generation, which
     /// supersedes any in-flight load.
     fn load(&mut self, path: PathBuf, _cx: &mut Context<Self>) {
+        self.path = Some(path.clone());
         let my_gen = LOAD_GEN.fetch_add(1, Ordering::SeqCst) + 1;
         let tx = self.tx.clone();
-        let fft_size = self.fft_size;
+        let analysis = self.analysis;
         std::thread::spawn(move || {
             let emit = |msg: LoadMsg| {
                 let _ = tx.send_blocking((my_gen, msg));
             };
-            if let Err(e) = worker(&path, fft_size, my_gen, &emit) {
+            if let Err(e) = worker(&path, analysis, my_gen, &emit) {
                 emit(LoadMsg::Err(format!(
                     "Failed to load {}: {e}",
                     file_name(&path)
                 )));
             }
         });
+    }
+
+    /// Re-run the analysis for the current track (after `f`/`w` changed a
+    /// parameter). No-op when no track is loaded yet.
+    fn reanalyse(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.path.clone() {
+            self.load(path, cx);
+        }
+    }
+
+    /// The FFT size currently in effect: the explicit override if set, else the
+    /// size the automatic height-derived geometry produced for the loaded track.
+    fn current_fft(&self) -> i32 {
+        self.analysis
+            .fft_size
+            .or_else(|| self.meta.map(|m| m.dft_size))
+            .unwrap_or(FFT_SIZES[3])
+    }
+
+    /// `f` / `Shift+F`: step the FFT size up (or `down`) from the current size.
+    /// Only acts when a track is present.
+    fn cycle_fft(&mut self, down: bool, cx: &mut Context<Self>) {
+        if self.path.is_none() {
+            return;
+        }
+        let cur = self.current_fft();
+        self.analysis.fft_size = Some(if down { fft_down(cur) } else { fft_up(cur) });
+        self.reanalyse(cx);
+    }
+
+    /// `w`: cycle the window function. Only acts when a track is present.
+    fn cycle_window(&mut self, cx: &mut Context<Self>) {
+        if self.path.is_none() {
+            return;
+        }
+        self.analysis.win_type = next_window(self.analysis.win_type);
+        self.reanalyse(cx);
     }
 
     /// Apply one worker message on the UI thread. Drops messages from a
@@ -400,11 +492,27 @@ impl Render for SpekApp {
         // file dropped anywhere in the window (no transparent overlay needed).
         div()
             .id("root")
+            .track_focus(&self.focus_handle)
             .size_full()
             .bg(rgb(BG))
             .font_family(UI_FONT)
             .flex()
             .flex_col()
+            // f steps the FFT size up, Shift+F down; w cycles the window function
+            // (only with a track loaded). Shift is allowed (it's f's reverse
+            // modifier); ignore key repeats and the other modifier combos so
+            // holding a key or pressing e.g. Ctrl+F doesn't fire.
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                let m = &ev.keystroke.modifiers;
+                if ev.is_held || m.control || m.alt || m.platform || m.function {
+                    return;
+                }
+                match ev.keystroke.key.as_str() {
+                    "f" => this.cycle_fft(m.shift, cx),
+                    "w" => this.cycle_window(cx),
+                    _ => {}
+                }
+            }))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 if let Some(path) = paths.paths().first() {
                     this.load(path.clone(), cx);
@@ -438,7 +546,14 @@ pub fn run(initial: Option<PathBuf>, fft_size: Option<i32>) -> Result<(), String
                     }),
                     ..Default::default()
                 },
-                |_window, cx| cx.new(|_cx| SpekApp::new(tx.clone(), legend.clone(), fft_size)),
+                |window, cx| {
+                    let focus = cx.focus_handle();
+                    let view =
+                        cx.new(|_cx| SpekApp::new(tx.clone(), legend.clone(), fft_size, focus.clone()));
+                    // Focus the root so it receives key events (f/w) from the start.
+                    focus.focus(window);
+                    view
+                },
             )
             .expect("failed to open window");
 
@@ -505,7 +620,7 @@ const PUBLISH_INTERVAL: Duration = Duration::from_micros(1_000_000 / TARGET_FPS)
 /// falls back to a single non-progressive render.
 fn worker(
     path: &Path,
-    fft_size: Option<i32>,
+    analysis: Analysis,
     my_gen: u64,
     sink: &dyn Fn(LoadMsg),
 ) -> Result<(), String> {
@@ -514,7 +629,7 @@ fn worker(
     let mut dec = audio::open(path)?;
     let rate = dec.rate();
     let channels = dec.channels();
-    let cfg = gui_config(fft_size)?;
+    let cfg = gui_config(analysis)?;
 
     let Some(total_len) = dec.total_len() else {
         // Length unknown: decode fully, then render once (no progressive fill).
@@ -530,8 +645,11 @@ fn worker(
             channels,
             samples,
         };
-        let (rgbas, meta) = build_image(&audio, fft_size)?;
-        sink(LoadMsg::Meta(meta, track_info(path, rate, channels, &meta)));
+        let (rgbas, meta) = build_image(&audio, analysis)?;
+        sink(LoadMsg::Meta(
+            meta,
+            track_info(path, rate, channels, &meta, analysis.win_type),
+        ));
         sink(LoadMsg::Done(make_images(rgbas)));
         return Ok(());
     };
@@ -540,7 +658,10 @@ fn worker(
     // Axes can be drawn immediately: the geometry (full time/frequency span) is
     // fixed up front, before any pixels exist.
     let meta = meta_from_proc(&proc);
-    sink(LoadMsg::Meta(meta, track_info(path, rate, channels, &meta)));
+    sink(LoadMsg::Meta(
+        meta,
+        track_info(path, rate, channels, &meta, analysis.win_type),
+    ));
 
     // Feed roughly 100 ms of audio per push so the per-channel parallel FFT has
     // a worthwhile batch, while keeping the UI updating several times a second.
@@ -586,10 +707,11 @@ fn worker(
 
 /// The Config the GUI renders with: a fixed high render resolution that gpui
 /// GPU-scales to the window, optionally overriding the FFT size.
-fn gui_config(fft_size: Option<i32>) -> Result<Config, String> {
+fn gui_config(analysis: Analysis) -> Result<Config, String> {
     let mut cfg = Config::default();
     cfg.x_size0 = RENDER_COLS;
-    match fft_size {
+    cfg.win_type = analysis.win_type;
+    match analysis.fft_size {
         // y_size sets dft per channel directly: dft = 2*(y_size-1) = n.
         Some(n) => cfg.y_size = n / 2 + 1,
         None => cfg.big_y_size = RENDER_HEIGHT,
@@ -614,9 +736,9 @@ fn meta_from_proc(p: &StreamProcessor) -> SpecMeta {
 /// Batch render (used by the unknown-length fallback above).
 fn build_image(
     a: &Audio,
-    fft_size: Option<i32>,
+    analysis: Analysis,
 ) -> Result<(Vec<(usize, usize, Vec<u8>)>, SpecMeta), String> {
-    let cfg = gui_config(fft_size)?;
+    let cfg = gui_config(analysis)?;
     let spec = spectrogram::process(cfg, a.rate, a.channels, &a.samples)?;
     let meta = SpecMeta::from(&spec);
     let rgbas = render::channel_images(&spec);
@@ -626,7 +748,13 @@ fn build_image(
 /// Two display rows: "Artist — Title" and a technical summary. Tags/format come
 /// from lofty; rate/channels come from the decoded audio; window size/function
 /// from our analysis. Never fails — falls back to the filename and extension.
-fn track_info(path: &Path, rate: f64, channels: u32, meta: &SpecMeta) -> TrackInfo {
+fn track_info(
+    path: &Path,
+    rate: f64,
+    channels: u32,
+    meta: &SpecMeta,
+    win_type: WindowType,
+) -> TrackInfo {
     let mut artist = None;
     let mut title = None;
     let mut bit_depth = None;
@@ -666,7 +794,7 @@ fn track_info(path: &Path, rate: f64, channels: u32, meta: &SpecMeta) -> TrackIn
         .map(|b| format!("{b}-bit"))
         .unwrap_or_else(|| "—".into());
     let line2 = format!(
-        "{fmt} · {channels} ch · {sr} · {depth} · {}-pt · Hann",
+        "{fmt} · {channels} ch · {sr} · {depth} · {}-pt · {win_type}",
         meta.dft_size
     );
 
