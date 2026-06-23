@@ -4,14 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+async-channel = "2.5"
 clap = { version = "4.6.1", features = ["unicode", "derive"] }
 clap_derive = "4.6.1"
 flate2 = "1.1.9"
-floem = { git = "https://github.com/lapce/floem", rev = "bcafaaad3fbf47091e28a64934295194d8e14463", version = "0.2.0", default-features = false, features = ["editor", "vger", "crossbeam", "serde", "image-png"] }
-floem_renderer = { git = "https://github.com/lapce/floem", rev = "bcafaaad3fbf47091e28a64934295194d8e14463", version = "0.2.0", features = ["crossbeam"] }
+# GUI backend (gpui-port branch): Zed's gpui instead of floem. The whole viewer
+# (src/gui.rs) is ported to gpui's element/entity model; everything else — audio
+# decode, spectrogram DSP and the RGBA/PNG rendering — is framework-agnostic and
+# unchanged, so the two branches are directly comparable for GUI performance.
+gpui = "0.2"
+image = "0.25"
 lofty = { version = "0.24.0", features = ["serde"] }
 png = { version = "0.18.1", features = ["zlib-rs"] }
 rayon = "1.12.0"
+smallvec = "1"
 rustfft = { version = "6.4.1", features = ["wasm_simd"] }
 # Trimmed from "all": dropped Matroska (mkv), CAF, and MP1/MP2 to shrink the
 # binary. Keeps the common audio formats incl. M4A/AAC (isomp4 + aac) and ALAC.
@@ -30,14 +36,6 @@ symphonia = { version = "0.6.0", default-features = false, features = [
     "aac",
     "alac",
 ] }
-
-# Redirect floem's transitive `floem-vger` (the wgpu glyph/image atlas backend)
-# to a fork that recycles the atlas when the packer is full. Upstream silently
-# drops images that don't fit, which blanks large/streamed images and any
-# session that loads several files. Based on floem's pinned 54ab813 (no wgpu
-# drift) plus the recycle fix.
-[patch."https://github.com/lapce/vger-rs"]
-floem-vger = { git = "https://github.com/arg274/vger-rs", rev = "402371e928b280e58c455e69b7b9f943ccf1486a" }
 
 [profile.release]
 opt-level = "s"     # optimize for size; hot crates overridden to opt-level 3 below

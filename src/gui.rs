@@ -1,41 +1,54 @@
-//! A Spek-like GUI built on floem: drag-and-drop an audio file and see its
+//! A Spek-like GUI built on gpui: drag-and-drop an audio file and see its
 //! spectrogram with frequency/time axes, a dBFS colour legend and the filename.
 //!
 //! The spectrogram heatmap is computed once per file on a background thread and
 //! GPU-scaled to fill the centre area, so resizing is cheap. Axes/labels are
-//! real floem text views (JetBrains Mono) drawn in gutters around the heatmap,
+//! real gpui text elements (JetBrains Mono) drawn in gutters around the heatmap,
 //! so they stay crisp regardless of how the heatmap is scaled. Tick positions
-//! are computed reactively from the live size of the heatmap area.
+//! are computed from the live size of the heatmap area on each render.
+//!
+//! This is a straight port of the floem viewer (`gpui-port` branch): identical
+//! content, layout and styling, just expressed with gpui's element/entity model
+//! instead of floem's reactive signals. The heatmap is drawn with a `canvas`
+//! element that blits one `RenderImage` per channel into its band via
+//! `Window::paint_image`, mirroring the floem `draw_img` path.
 
-use std::collections::VecDeque;
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lofty::file::{FileType, TaggedFileExt};
 use lofty::prelude::{Accessor, AudioFile};
 
-use floem::action::debounce_action;
-use floem::event::listener;
-use floem::ext_event::{register_ext_trigger, ExtSendTrigger};
-use floem::kurbo::{Rect, Size};
-use floem::peniko::{Blob, Color, ImageAlphaType, ImageBrush, ImageData, ImageFormat, ImageQuality};
-use floem::reactive::{RwSignal, Scope, SignalGet, SignalUpdate};
-use floem::unit::UnitExt;
-use floem::views::{canvas, dyn_view, img, Decorators, Empty, Label, Stack};
-use floem::window::WindowConfig;
-use floem::{Application, IntoView, Renderer, View};
-use floem_renderer::Img;
+use gpui::prelude::*;
+use gpui::{
+    canvas, div, img, point, px, rgb, size, App, Application, AsyncApp, Bounds, Context, Corners,
+    Div, ExternalPaths, ObjectFit, Pixels, Render, RenderImage, SharedString, TitlebarOptions,
+    Window, WindowBounds, WindowOptions,
+};
+use image::{Frame, RgbaImage};
+use smallvec::SmallVec;
 
 use crate::audio::{self, Audio};
 use crate::render;
-use crate::spectrogram::{self, Config, Spectrogram, StreamProcessor};
+use crate::spectrogram::{self, Config, StreamProcessor};
 
 const FONT: &str = "JetBrains Mono";
 const PLACEHOLDER: &str = "Drag and drop an audio file.";
 
-// Fixed render resolution; floem GPU-scales it to fill the centre area.
+/// The monospace font for axis/legend labels, embedded so the viewer renders
+/// identically regardless of which fonts are installed on the machine.
+const FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono.ttf");
+
+/// The proportional UI font for all other text (title rows, status/placeholder),
+/// also embedded. Set on the root element so it cascades to every child; the
+/// monospace labels override it explicitly.
+const UI_FONT: &str = "Geist";
+const UI_FONT_BYTES: &[u8] = include_bytes!("../assets/Geist.ttf");
+
+// Fixed render resolution; gpui GPU-scales it to fill the centre area.
 const RENDER_COLS: i32 = 2400;
 const RENDER_HEIGHT: i32 = 1320;
 
@@ -44,14 +57,23 @@ const FREQ_W: f64 = 72.0;
 const TIME_H: f64 = 34.0;
 const LEGEND_W: f64 = 84.0;
 const LEGEND_GAP_PX: f64 = 12.0; // gap between the spectrogram and the legend bar
-const TITLE_H: f64 = 66.0; // two rows: "Artist — Title" + technical info
+const TITLE_H: f64 = 74.0; // two rows: "Artist — Title" + technical info
 const CHANNEL_GAP_PX: f64 = 8.0; // layout gap between stacked channel images
 
 // Colours.
-const BG: Color = Color::from_rgb8(0x12, 0x12, 0x16);
-const GUTTER_BG: Color = Color::from_rgb8(0x1a, 0x1a, 0x20);
-const LABEL: Color = Color::from_rgb8(0xb8, 0xb8, 0xc4);
-const TITLE: Color = Color::from_rgb8(0xe8, 0xe8, 0xf0);
+const BG: u32 = 0x12_12_16;
+const GUTTER_BG: u32 = 0x1a_1a_20;
+const LABEL: u32 = 0xb8_b8_c4;
+const TITLE: u32 = 0xe8_e8_f0;
+
+const WIN_W: f64 = 1100.0;
+const WIN_H: f64 = 680.0;
+
+/// `f64` logical px → gpui `Pixels`.
+#[inline]
+fn p(x: f64) -> Pixels {
+    px(x as f32)
+}
 
 /// Metadata needed to draw the axes (everything is Copy, so it's Send for the
 /// worker→UI hand-off).
@@ -67,7 +89,7 @@ struct SpecMeta {
 }
 
 impl SpecMeta {
-    fn from(spec: &Spectrogram) -> Self {
+    fn from(spec: &spectrogram::Spectrogram) -> Self {
         SpecMeta {
             rate: spec.rate,
             channels: spec.chans as i32,
@@ -93,19 +115,9 @@ struct TrackInfo {
     line2: String, // "FLAC · 2 ch · 44.1 kHz · 16-bit · 1024-pt · Hann"
 }
 
-/// One channel's spectrogram as a GPU-uploadable image brush, with a stable
-/// cache key so the renderer uploads the texture once and reuses it.
-#[derive(Clone)]
-struct ChannelTex {
-    brush: ImageBrush,
-    hash: Arc<[u8]>,
-}
-
-static NEXT_GEN: AtomicU64 = AtomicU64::new(0);
-
 /// The active load generation. Each drag-and-drop (or initial load) bumps it;
 /// the in-flight worker for an older generation aborts at its next checkpoint and
-/// the UI sink drops any of its already-queued messages, so a newly dropped file
+/// the UI drops any of its already-queued messages, so a newly dropped file
 /// cleanly supersedes one that's still rendering.
 static LOAD_GEN: AtomicU64 = AtomicU64::new(0);
 
@@ -113,29 +125,22 @@ fn is_current(my_gen: u64) -> bool {
     LOAD_GEN.load(Ordering::SeqCst) == my_gen
 }
 
-/// Build one `ImageBrush` per channel directly from raw RGBA (no PNG round-trip).
-fn make_texs(rgbas: Vec<(usize, usize, Vec<u8>)>) -> Vec<ChannelTex> {
-    let gen_id = NEXT_GEN.fetch_add(1, Ordering::Relaxed);
+/// Build one `Arc<RenderImage>` per channel directly from raw RGBA (no PNG
+/// round-trip). gpui's `RenderImage` stores BGRA, so we swap R↔B in place. A
+/// fresh `RenderImage` (hence a fresh GPU texture id) is created per call, which
+/// is what lets a streaming load replace the previous frame's texture.
+fn make_images(rgbas: Vec<(usize, usize, Vec<u8>)>) -> Vec<Arc<RenderImage>> {
     rgbas
         .into_iter()
-        .enumerate()
-        .map(|(k, (w, h, rgba))| {
-            let blob = Blob::new(Arc::new(rgba));
-            let brush = ImageBrush::new(ImageData {
-                data: blob,
-                format: ImageFormat::Rgba8,
-                alpha_type: ImageAlphaType::Alpha,
-                width: w as u32,
-                height: h as u32,
-            })
-            .with_quality(ImageQuality::High);
-            // Stable, unique key: (load generation, channel index).
-            let mut key = gen_id.to_le_bytes().to_vec();
-            key.push(k as u8);
-            ChannelTex {
-                brush,
-                hash: Arc::from(key),
+        .map(|(w, h, mut rgba)| {
+            for px4 in rgba.chunks_exact_mut(4) {
+                px4.swap(0, 2); // RGBA -> BGRA
             }
+            let buf = RgbaImage::from_raw(w as u32, h as u32, rgba)
+                .expect("rgba buffer length must equal w*h*4");
+            let frame = Frame::new(buf);
+            let frames: SmallVec<[Frame; 1]> = SmallVec::from_buf([frame]);
+            Arc::new(RenderImage::new(frames))
         })
         .collect()
 }
@@ -147,251 +152,333 @@ enum LoadMsg {
     /// Geometry/metadata known: draw the axes (before any pixels exist).
     Meta(SpecMeta, TrackInfo),
     /// A progressive snapshot (full target width, partially filled).
-    Frame(Vec<(usize, usize, Vec<u8>)>),
+    Frame(Vec<Arc<RenderImage>>),
     /// The final, complete image.
-    Done(Vec<(usize, usize, Vec<u8>)>),
+    Done(Vec<Arc<RenderImage>>),
     /// Decode/analyse failed.
     Err(String),
 }
 
-/// A thread-safe sink that marshals [`LoadMsg`]s onto the UI thread and runs
-/// `handler` for each, in order, never dropping a message (it drains a queue).
-///
-/// floem's `create_ext_action` is one-shot and `update_signal_from_channel`
-/// funnels through a single-slot signal (which can coalesce away intermediate
-/// values); a streaming load needs every Meta/Done delivered, so we keep our own
-/// queue and wake the UI with an `ExtSendTrigger`.
-fn make_sink(handler: impl Fn(u64, LoadMsg) + 'static) -> Arc<dyn Fn(u64, LoadMsg) + Send + Sync> {
-    let cx = Scope::new();
-    let trigger = cx.enter(ExtSendTrigger::new);
-    let queue: Arc<Mutex<VecDeque<(u64, LoadMsg)>>> = Arc::new(Mutex::new(VecDeque::new()));
-    {
-        let queue = queue.clone();
-        cx.create_effect(move |_| {
-            trigger.track();
-            // Drain everything queued since the last wake.
-            loop {
-                let next = queue.lock().unwrap().pop_front();
-                match next {
-                    Some((load_gen, msg)) => handler(load_gen, msg),
-                    None => break,
-                }
+/// Channel the worker thread pushes [`LoadMsg`]s into; a `cx.spawn` task on the
+/// UI thread drains it and applies each one in order.
+type Sender = async_channel::Sender<(u64, LoadMsg)>;
+
+/// The root view: holds all the state the previous floem build kept in signals.
+struct SpekApp {
+    tx: Sender,
+    fft_size: Option<i32>,
+    images: Vec<Arc<RenderImage>>, // one image per channel
+    status: SharedString,
+    info: TrackInfo,
+    meta: Option<SpecMeta>,
+    legend: Arc<RenderImage>, // dBFS colour-scale gradient bar
+}
+
+impl SpekApp {
+    fn new(tx: Sender, legend: Arc<RenderImage>, fft_size: Option<i32>) -> Self {
+        SpekApp {
+            tx,
+            fft_size,
+            images: Vec::new(),
+            status: SharedString::from(PLACEHOLDER),
+            info: TrackInfo::default(),
+            meta: None,
+            legend,
+        }
+    }
+
+    /// Spawn the background worker that decodes `path` and streams the
+    /// spectrogram to the UI through the channel. Claims a new generation, which
+    /// supersedes any in-flight load.
+    fn load(&mut self, path: PathBuf, _cx: &mut Context<Self>) {
+        let my_gen = LOAD_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+        let tx = self.tx.clone();
+        let fft_size = self.fft_size;
+        std::thread::spawn(move || {
+            let emit = |msg: LoadMsg| {
+                let _ = tx.send_blocking((my_gen, msg));
+            };
+            if let Err(e) = worker(&path, fft_size, my_gen, &emit) {
+                emit(LoadMsg::Err(format!(
+                    "Failed to load {}: {e}",
+                    file_name(&path)
+                )));
             }
         });
     }
-    Arc::new(move |load_gen: u64, msg: LoadMsg| {
-        queue.lock().unwrap().push_back((load_gen, msg));
-        register_ext_trigger(trigger);
-    })
-}
 
-type Sink = Arc<dyn Fn(u64, LoadMsg) + Send + Sync>;
-
-const WIN_W: f64 = 1100.0;
-const WIN_H: f64 = 680.0;
-
-pub fn run(initial: Option<PathBuf>, fft_size: Option<i32>) -> Result<(), String> {
-    Application::new()
-        .window(
-            move |_| build_ui(initial, fft_size),
-            Some(
-                WindowConfig::default()
-                    .size(Size::new(WIN_W, WIN_H))
-                    .title("RustSpeck"),
-            ),
-        )
-        .run();
-    Ok(())
-}
-
-/// Build the whole view tree. Must run inside the window closure so its signals
-/// and views are created within floem's runtime scope (otherwise nothing mounts).
-fn build_ui(initial: Option<PathBuf>, fft_size: Option<i32>) -> impl IntoView {
-    let image = RwSignal::new(Vec::<ChannelTex>::new()); // one image brush per channel
-    let status = RwSignal::new(PLACEHOLDER.to_string());
-    let info = RwSignal::new(TrackInfo::default());
-    let meta = RwSignal::new(None::<SpecMeta>);
-    // Centre (heatmap) area size in logical px — derived from the window size
-    // minus the fixed gutters. Initialised from the configured window size so
-    // axis labels are placed correctly before the first resize event.
-    let area = RwSignal::new(centre_area(WIN_W, WIN_H));
-    // Raw window size, written cheaply on every resize event; a debounced effect
-    // (below) turns it into `area` once the drag settles, so we don't rebuild the
-    // axis labels on every event.
-    let raw_size = RwSignal::new((WIN_W as u32, WIN_H as u32));
-    let legend = RwSignal::new(render::legend_png(120).unwrap_or_default());
-    // Root view id, set after the tree is built; used to force a full repaint
-    // when the axis views are rebuilt (on resize / worker update).
-    let repaint = RwSignal::new(None::<floem::ViewId>);
-
-    // UI sink: the worker thread sends LoadMsgs here; the handler runs on the UI
-    // thread and fans each one out to the signals above (which drive the views).
-    let sink = make_sink(move |load_gen, msg| {
-        // Drop messages from a superseded load (a newer file was dropped while
-        // this one was still rendering), so only the active load paints.
+    /// Apply one worker message on the UI thread. Drops messages from a
+    /// superseded load (a newer file was dropped while this one was still
+    /// rendering), so only the active load paints.
+    fn handle(&mut self, load_gen: u64, msg: LoadMsg, cx: &mut Context<Self>) {
         if load_gen != LOAD_GEN.load(Ordering::SeqCst) {
             return;
         }
         match msg {
             LoadMsg::Start(name) => {
-                status.set(format!("Loading {name}…"));
-                image.set(Vec::new());
+                self.status = SharedString::from(format!("Loading {name}…"));
+                self.images.clear();
             }
             LoadMsg::Meta(m, ti) => {
-                meta.set(Some(m));
-                info.set(ti);
+                self.meta = Some(m);
+                self.info = ti;
             }
-            LoadMsg::Frame(rgbas) | LoadMsg::Done(rgbas) => {
-                image.set(make_texs(rgbas));
+            LoadMsg::Frame(imgs) | LoadMsg::Done(imgs) => {
+                self.images = imgs;
             }
             LoadMsg::Err(e) => {
-                status.set(e);
-                image.set(Vec::new());
+                self.status = SharedString::from(e);
+                self.images.clear();
             }
         }
-        if let Some(id) = repaint.get_untracked() {
-            id.request_all();
-        }
-    });
-
-    // Load any file given on the command line — streamed like a drag-and-drop.
-    if let Some(p) = initial {
-        load_async(p, sink.clone(), fft_size);
+        cx.notify();
     }
+}
 
-    // --- Heatmap (centre) — a canvas drawing each channel's image into its band.
-    // Drawing the RGBA brushes directly skips the PNG encode/decode round-trip;
-    // the renderer caches each texture by its hash and GPU-scales on resize.
-    let centre = dyn_view(move || {
-        let texs = image.get();
-        if texs.is_empty() {
-            Label::derived(move || status.get())
-                .style(|s| s.size_full().items_center().justify_center().color(LABEL))
-                .into_any()
+impl Render for SpekApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Centre (heatmap) area size in logical px — the live window size minus
+        // the fixed gutters. Tick positions are derived from this each render.
+        let vp = window.viewport_size();
+        let (area_w, area_h) = centre_area(f32::from(vp.width) as f64, f32::from(vp.height) as f64);
+
+        // --- Title row ---
+        let title = if self.info.line1.is_empty() {
+            div()
+                .h(p(TITLE_H))
+                .w_full()
+                .flex_shrink_0()
+                .bg(rgb(GUTTER_BG))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(TITLE))
+                .text_size(px(14.0))
+                .child("RustSpeck")
         } else {
-            let n = texs.len();
-            canvas(move |cx, size| {
-                let gap = CHANNEL_GAP_PX;
-                let band_h = ((size.height - (n as f64 - 1.0) * gap) / n as f64).max(1.0);
-                for (k, t) in texs.iter().enumerate() {
-                    let top = k as f64 * (band_h + gap);
-                    let rect = Rect::new(0.0, top, size.width, top + band_h);
-                    cx.draw_img(
-                        Img {
-                            img: t.brush.clone(),
-                            hash: &t.hash,
-                        },
-                        rect,
-                    );
+            // Metadata rows inherit the proportional UI font (Geist) from the
+            // root; only the axis/legend labels are monospace. Left-aligned,
+            // indented so the text starts at the spectrogram's left edge.
+            div()
+                .h(p(TITLE_H))
+                .w_full()
+                .flex_shrink_0()
+                .bg(rgb(GUTTER_BG))
+                .flex()
+                .flex_col()
+                .items_start()
+                // Top-anchored (not centred) so the block sits a little lower
+                // from the top edge, with the two rows close together.
+                .justify_start()
+                .pl(p(FREQ_W))
+                .pt(px(20.0))
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .text_color(rgb(TITLE))
+                        .text_size(px(16.0))
+                        .child(SharedString::from(self.info.line1.clone())),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(LABEL))
+                        .text_size(px(12.0))
+                        .child(SharedString::from(self.info.line2.clone())),
+                )
+        };
+
+        // --- Frequency gutter (left) ---
+        // Content is absolutely positioned (zero intrinsic size), so flex_shrink_0
+        // reserves the gutter's fixed width; the heatmap (flex_1 + min 0) is the
+        // only thing that gives when the window shrinks.
+        let freq_axis = div()
+            .w(p(FREQ_W))
+            .h_full()
+            .flex_shrink_0()
+            .bg(rgb(GUTTER_BG))
+            .relative()
+            .children(freq_axis_labels(self.meta, area_h));
+
+        // --- Heatmap (centre) ---
+        let centre_base = div()
+            .flex_1()
+            .h_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0));
+        let centre = if self.images.is_empty() {
+            centre_base
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(LABEL))
+                .child(self.status.clone())
+        } else {
+            // Draw each channel's image into its band. The renderer caches each
+            // texture by id and GPU-scales it on resize, so dragging is cheap.
+            let imgs = self.images.clone();
+            centre_base.child(
+                canvas(
+                    |_bounds, _window, _cx| {},
+                    move |bounds, _state, window, _cx| {
+                        let n = imgs.len();
+                        if n == 0 {
+                            return;
+                        }
+                        let gap = CHANNEL_GAP_PX as f32;
+                        let total = f32::from(bounds.size.height) - (n as f32 - 1.0) * gap;
+                        let band_h = (total / n as f32).max(1.0);
+                        for (k, im) in imgs.iter().enumerate() {
+                            let top = f32::from(bounds.origin.y) + k as f32 * (band_h + gap);
+                            let rect = Bounds {
+                                origin: point(bounds.origin.x, px(top)),
+                                size: size(bounds.size.width, px(band_h)),
+                            };
+                            let _ = window.paint_image(
+                                rect,
+                                Corners::default(),
+                                im.clone(),
+                                0,
+                                false,
+                            );
+                        }
+                    },
+                )
+                .size_full(),
+            )
+        };
+
+        // --- Legend gutter (right) ---
+        let bar = img(self.legend.clone())
+            .w(px(16.0))
+            .h_full()
+            .object_fit(ObjectFit::Fill);
+        let scale = div()
+            .flex_1()
+            .h_full()
+            .relative()
+            .children(legend_labels(self.meta, area_h));
+        let legend_gutter = div()
+            .w(p(LEGEND_W))
+            .h_full()
+            .flex_shrink_0()
+            .bg(rgb(GUTTER_BG))
+            .flex()
+            .flex_row()
+            // Pad left so the colour bar doesn't butt up against the spectrogram.
+            .pl(p(LEGEND_GAP_PX))
+            .child(bar)
+            .child(scale);
+
+        let row = div()
+            .flex()
+            .flex_row()
+            .w_full()
+            .flex_1()
+            .min_h(px(0.0))
+            .child(freq_axis)
+            .child(centre)
+            .child(legend_gutter);
+
+        // --- Time axis (bottom) ---
+        let bottom = div()
+            .h(p(TIME_H))
+            .w_full()
+            .flex_shrink_0()
+            .bg(rgb(GUTTER_BG))
+            .flex()
+            .flex_row()
+            .child(div().w(p(FREQ_W)).flex_shrink_0())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full()
+                    .relative()
+                    .children(time_axis_labels(self.meta, area_w)),
+            )
+            .child(div().w(p(LEGEND_W)).flex_shrink_0());
+
+        // gpui bubbles drop events up, so a single root-level handler catches a
+        // file dropped anywhere in the window (no transparent overlay needed).
+        div()
+            .id("root")
+            .size_full()
+            .bg(rgb(BG))
+            .font_family(UI_FONT)
+            .flex()
+            .flex_col()
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                if let Some(path) = paths.paths().first() {
+                    this.load(path.clone(), cx);
                 }
-            })
-            .style(|s| s.size_full())
-            .into_any()
-        }
-    })
-    .style(|s| s.flex_grow(1.0).height_full().min_width(0.0).min_height(0.0));
+            }))
+            .child(title)
+            .child(row)
+            .child(bottom)
+    }
+}
 
-    // --- Axis gutters ---
-    // flex_shrink(0): the gutters' content is absolutely positioned (zero
-    // intrinsic size), so without this flexbox would shrink them to nothing and
-    // the heatmap would expand over them. Fixed-size gutters reserve their space;
-    // the heatmap (flex_grow + min_width 0) is the only thing that gives.
-    let freq_axis = dyn_view(move || freq_axis_labels(meta.get(), area.get().1))
-        .style(|s| s.width(FREQ_W.pt()).height_full().flex_shrink(0.0).background(GUTTER_BG));
+pub fn run(initial: Option<PathBuf>, fft_size: Option<i32>) -> Result<(), String> {
+    Application::new().run(move |cx: &mut App| {
+        // Register the bundled monospace font so `.font_family(FONT)` resolves to
+        // it whether or not JetBrains Mono is installed system-wide.
+        let _ = cx
+            .text_system()
+            .add_fonts(vec![Cow::Borrowed(FONT_BYTES), Cow::Borrowed(UI_FONT_BYTES)]);
 
-    let legend_gutter = dyn_view(move || legend_view(meta.get(), area.get().1, legend.get()))
-        .style(|s| s.width(LEGEND_W.pt()).height_full().flex_shrink(0.0).background(GUTTER_BG));
+        let (tx, rx) = async_channel::unbounded::<(u64, LoadMsg)>();
+        let legend = make_legend();
 
-    let row = Stack::horizontal((freq_axis, centre, legend_gutter))
-        .style(|s| s.flex_grow(1.0).width_full().min_width(0.0).min_height(0.0));
+        let bounds = Bounds::centered(None, size(px(WIN_W as f32), px(WIN_H as f32)), cx);
+        let handle = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(SharedString::from("RustSpeck")),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                |_window, cx| cx.new(|_cx| SpekApp::new(tx.clone(), legend.clone(), fft_size)),
+            )
+            .expect("failed to open window");
 
-    let time_axis = dyn_view(move || time_axis_labels(meta.get(), area.get().0))
-        .style(|s| s.size_full());
-    let bottom = Stack::horizontal((
-        Empty::new().style(|s| s.width(FREQ_W.pt()).flex_shrink(0.0)),
-        time_axis.style(|s| s.flex_grow(1.0).min_width(0.0).height_full()),
-        Empty::new().style(|s| s.width(LEGEND_W.pt()).flex_shrink(0.0)),
-    ))
-    .style(|s| s.height(TIME_H.pt()).width_full().flex_shrink(0.0).background(GUTTER_BG));
-
-    let title = dyn_view(move || {
-        let ti = info.get();
-        if ti.line1.is_empty() {
-            Label::derived(|| "RustSpeck".to_string())
-                .style(|s| {
-                    s.size_full()
-                        .items_center()
-                        .justify_center()
-                        .color(TITLE)
-                        .font_family(FONT.to_string())
-                        .font_size(14.0)
-                })
-                .into_any()
-        } else {
-            Stack::vertical((
-                // Metadata rows use the default proportional font (only the
-                // axis/legend labels are monospace).
-                Label::new(ti.line1).style(|s| s.color(TITLE).font_size(16.0)),
-                Label::new(ti.line2).style(|s| s.color(LABEL).font_size(12.0)),
-            ))
-            // Left-aligned, indented so the text starts at the spectrogram's
-            // left edge (just past the frequency gutter).
-            .style(|s| {
-                s.size_full()
-                    .items_start()
-                    .justify_center()
-                    .padding_left(FREQ_W.pt())
-                    .row_gap(8.0.pt())
-            })
-            .into_any()
-        }
-    })
-    .style(|s| {
-        s.height(TITLE_H.pt())
-            .width_full()
-            .flex_shrink(0.0)
-            .background(GUTTER_BG)
-    });
-
-    let content = Stack::vertical((title, row, bottom)).style(|s| s.size_full().background(BG));
-    // Repaint target: the visible content subtree (worker updates / resize).
-    repaint.set(Some(content.id()));
-
-    // Recompute the centre area (which repositions every axis label) only once
-    // resizing has paused for a beat. Rebuilding dozens of labels — and the
-    // glyph re-shaping/atlas churn that comes with it — on every WindowResized
-    // event is what makes dragging janky on multi-channel files. The heatmap
-    // itself still scales live during the drag (its canvas is size_full).
-    debounce_action(raw_size, Duration::from_millis(120), move || {
-        let (w, h) = raw_size.get_untracked();
-        let sz = centre_area(w as f64, h as f64);
-        if area.get_untracked() != sz {
-            area.set(sz);
-            if let Some(id) = repaint.get_untracked() {
-                id.request_all();
+        // UI sink: drain the worker channel on the UI thread and apply each
+        // message in order, never coalescing (the channel is unbounded and every
+        // message gets its own `handle`).
+        cx.spawn(async move |cx: &mut AsyncApp| {
+            while let Ok((load_gen, msg)) = rx.recv().await {
+                let _ = handle.update(cx, |app, _window, cx| app.handle(load_gen, msg, cx));
             }
-        }
-    });
-
-    // floem dispatches file-drag events only to the *topmost view under the
-    // cursor* (Phases::TARGET, no bubbling). So a transparent full-window overlay
-    // on top catches drops anywhere, regardless of which gutter/image is beneath.
-    let drop_catcher = Empty::new()
-        .style(|s| s.absolute().inset(0.0).size_full())
-        .on_event_stop(listener::FileDragDrop, move |_cx, ev| {
-            if let Some(path) = ev.paths.first() {
-                load_async(path.clone(), sink.clone(), fft_size);
-            }
-        });
-
-    Stack::vertical((content, drop_catcher))
-        .style(|s| s.size_full())
-        .on_event_cont(listener::WindowResized, move |_cx, size| {
-            // Cheap: just record the size. The expensive recalc (axis-label
-            // rebuild + repaint) is debounced above so it runs once, after the
-            // drag settles, instead of on every event.
-            raw_size.set((size.width.round() as u32, size.height.round() as u32));
         })
+        .detach();
+
+        // Load any file given on the command line — streamed like a drag-and-drop.
+        if let Some(path) = initial {
+            let _ = handle.update(cx, |app, _window, cx| app.load(path, cx));
+        }
+
+        cx.activate(true);
+    });
+    Ok(())
+}
+
+/// Build the dBFS colour-scale gradient bar as a single GPU image. The shared
+/// renderer emits it as a PNG (same bytes the CLI/floem build use); we decode it
+/// once at startup, so `render.rs` stays identical across both GUI branches.
+fn make_legend() -> Arc<RenderImage> {
+    let png = render::legend_png(120).unwrap_or_default();
+    let (w, h, rgba) = match image::load_from_memory(&png) {
+        Ok(decoded) => {
+            let buf = decoded.to_rgba8();
+            (buf.width() as usize, buf.height() as usize, buf.into_raw())
+        }
+        Err(_) => (1, 1, vec![0, 0, 0, 0xff]),
+    };
+    make_images(vec![(w, h, rgba)])
+        .pop()
+        .expect("one legend image")
 }
 
 /// Centre (heatmap) area size = window size minus the fixed gutters.
@@ -400,22 +487,6 @@ fn centre_area(win_w: f64, win_h: f64) -> (f64, f64) {
         (win_w - FREQ_W - LEGEND_W).max(1.0),
         (win_h - TITLE_H - TIME_H).max(1.0),
     )
-}
-
-/// Spawn the background worker that decodes `path` and streams the spectrogram
-/// to the UI through `sink`.
-fn load_async(path: PathBuf, sink: Sink, fft_size: Option<i32>) {
-    // Claim a new generation: this supersedes any in-flight load.
-    let my_gen = LOAD_GEN.fetch_add(1, Ordering::SeqCst) + 1;
-    std::thread::spawn(move || {
-        let emit = move |msg: LoadMsg| sink(my_gen, msg);
-        if let Err(e) = worker(&path, fft_size, my_gen, &emit) {
-            emit(LoadMsg::Err(format!(
-                "Failed to load {}: {e}",
-                file_name(&path)
-            )));
-        }
-    });
 }
 
 /// Publish a progressive frame at most ~16×/sec, and only when new columns have
@@ -454,7 +525,7 @@ fn worker(
         };
         let (rgbas, meta) = build_image(&audio, fft_size)?;
         sink(LoadMsg::Meta(meta, track_info(path, rate, channels, &meta)));
-        sink(LoadMsg::Done(rgbas));
+        sink(LoadMsg::Done(make_images(rgbas)));
         return Ok(());
     };
 
@@ -474,7 +545,7 @@ fn worker(
     let mut publish = |proc: &StreamProcessor, force: bool| {
         let cols = proc.cols_done();
         if cols > 0 && (force || (cols != last_cols && last_publish.elapsed() >= PUBLISH_INTERVAL)) {
-            sink(LoadMsg::Frame(render::stream_channel_images(proc)));
+            sink(LoadMsg::Frame(make_images(render::stream_channel_images(proc))));
             last_publish = Instant::now();
             last_cols = cols;
         }
@@ -501,17 +572,12 @@ fn worker(
 
     // Final image, rendered at the full target width (x_size) — the SAME
     // dimensions as the streaming frames — so the renderer recycles those
-    // textures in place. Rendering at the exact column count (which can be a
-    // pixel short of x_size when the audio doesn't land exactly on a column
-    // boundary) would be a different size, defeating region reuse: on a full
-    // atlas the final frame then fails to pack and the spectrogram blanks.
-    // With normalize off (the GUI default) this is identical data to the batch
-    // render, just padded with the trailing background column.
-    sink(LoadMsg::Done(render::stream_channel_images(&proc)));
+    // textures in place.
+    sink(LoadMsg::Done(make_images(render::stream_channel_images(&proc))));
     Ok(())
 }
 
-/// The Config the GUI renders with: a fixed high render resolution that floem
+/// The Config the GUI renders with: a fixed high render resolution that gpui
 /// GPU-scales to the window, optionally overriding the FFT size.
 fn gui_config(fft_size: Option<i32>) -> Result<Config, String> {
     let mut cfg = Config::default();
@@ -633,11 +699,11 @@ fn file_stem(p: &Path) -> String {
 
 // --- Axis label / grid construction ---
 
-fn freq_axis_labels(meta: Option<SpecMeta>, area_h: f64) -> impl IntoView {
+fn freq_axis_labels(meta: Option<SpecMeta>, area_h: f64) -> Vec<Div> {
     let mut views = Vec::new();
     if let Some(m) = meta {
         let nyq = m.nyquist();
-        // Bands match the centre v_stack: equal flex bands separated by gaps.
+        // Bands match the centre heatmap: equal flex bands separated by gaps.
         let n = m.channels.max(1) as f64;
         let band_h = ((area_h - (n - 1.0) * CHANNEL_GAP_PX) / n).max(1.0);
         let step = nice_step(nyq, freq_target(band_h));
@@ -659,25 +725,15 @@ fn freq_axis_labels(meta: Option<SpecMeta>, area_h: f64) -> impl IntoView {
                 // bottom edge and the peak at its top, never bleeding into a gap.
                 let hi = (band_top + band_h - 14.0).max(band_top);
                 let top = (y - 7.0).clamp(band_top, hi);
-                let txt = fmt_freq(f);
-                views.push(Label::new(txt).style(move |s| {
-                    s.absolute()
-                        .inset_top(top.pt())
-                        .inset_left(0.0.pt())
-                        .width((FREQ_W - 10.0).pt()) // right-aligned, hugging the plot
-                        .height(14.0.pt())
-                        .justify_end()
-                        .font_family(FONT.to_string())
-                        .font_size(11.0)
-                        .color(LABEL)
-                }));
+                // Right-aligned, hugging the plot.
+                views.push(tick_label(0.0, top, FREQ_W - 10.0, Align::End, fmt_freq(f)));
             }
         }
     }
-    Stack::from_iter(views).style(|s| s.size_full())
+    views
 }
 
-fn time_axis_labels(meta: Option<SpecMeta>, area_w: f64) -> impl IntoView {
+fn time_axis_labels(meta: Option<SpecMeta>, area_w: f64) -> Vec<Div> {
     let mut views = Vec::new();
     if let Some(m) = meta {
         let span = m.time_span();
@@ -688,42 +744,24 @@ fn time_axis_labels(meta: Option<SpecMeta>, area_w: f64) -> impl IntoView {
             while t <= span + 1e-6 {
                 let frac = (t / span).clamp(0.0, 1.0);
                 let x = frac * area_w;
-                let txt = fmt_time(t);
                 // Anchor the tick value at x: the first tick is flush-left so 0
                 // sits at the true left edge, the last flush-right, rest centred.
                 let (left, align) = if frac <= 1e-6 {
-                    (0.0, 0u8)
+                    (0.0, Align::Start)
                 } else if frac >= 1.0 - 1e-6 {
-                    ((area_w - w).max(0.0), 2u8)
+                    ((area_w - w).max(0.0), Align::End)
                 } else {
-                    ((x - w / 2.0).clamp(0.0, (area_w - w).max(0.0)), 1u8)
+                    ((x - w / 2.0).clamp(0.0, (area_w - w).max(0.0)), Align::Center)
                 };
-                views.push(Label::new(txt).style(move |s| {
-                    let s = s
-                        .absolute()
-                        .inset_left(left.pt())
-                        .inset_top(9.0.pt())
-                        .width(w.pt())
-                        .height(14.0.pt())
-                        .font_family(FONT.to_string())
-                        .font_size(11.0)
-                        .color(LABEL);
-                    match align {
-                        0 => s.justify_start(),
-                        2 => s.justify_end(),
-                        _ => s.justify_center(),
-                    }
-                }));
+                views.push(tick_label(left, 9.0, w, align, fmt_time(t)));
                 t += step;
             }
         }
     }
-    Stack::from_iter(views).style(|s| s.size_full())
+    views
 }
 
-fn legend_view(meta: Option<SpecMeta>, area_h: f64, gradient: Vec<u8>) -> impl IntoView {
-    let bar = img(move || gradient.clone()).style(|s| s.width(16.0.pt()).height_full());
-
+fn legend_labels(meta: Option<SpecMeta>, area_h: f64) -> Vec<Div> {
     let mut labels = Vec::new();
     if let Some(m) = meta {
         let range = m.db_range as f64;
@@ -736,23 +774,40 @@ fn legend_view(meta: Option<SpecMeta>, area_h: f64, gradient: Vec<u8>) -> impl I
             } else {
                 format!("-{}", d as i64)
             };
-            labels.push(Label::new(txt).style(move |s| {
-                s.absolute()
-                    .inset_top(top.pt())
-                    .inset_left(6.0.pt())
-                    .width((LEGEND_W - 24.0).pt())
-                    .height(14.0.pt())
-                    .font_family(FONT.to_string())
-                    .font_size(11.0)
-                    .color(LABEL)
-            }));
+            labels.push(tick_label(6.0, top, LEGEND_W - 24.0, Align::Start, txt));
             d += 20.0;
         }
     }
-    let scale = Stack::from_iter(labels).style(|s| s.flex_grow(1.0).height_full());
+    labels
+}
 
-    // Pad left so the colour bar doesn't butt up against the spectrogram.
-    Stack::horizontal((bar, scale)).style(|s| s.size_full().padding_left(LEGEND_GAP_PX.pt()))
+/// Horizontal alignment of a tick label inside its (absolutely-positioned) box.
+#[derive(Clone, Copy)]
+enum Align {
+    Start,
+    Center,
+    End,
+}
+
+/// One absolutely-positioned monospace tick label.
+fn tick_label(left: f64, top: f64, w: f64, align: Align, text: String) -> Div {
+    let d = div()
+        .absolute()
+        .left(p(left))
+        .top(p(top))
+        .w(p(w))
+        .h(p(14.0))
+        .flex()
+        .items_center()
+        .font_family(FONT)
+        .text_size(px(11.0))
+        .text_color(rgb(LABEL))
+        .child(SharedString::from(text));
+    match align {
+        Align::Start => d.justify_start(),
+        Align::Center => d.justify_center(),
+        Align::End => d.justify_end(),
+    }
 }
 
 // --- tick math ---
