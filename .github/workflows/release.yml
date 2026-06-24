@@ -30,7 +30,7 @@ jobs:
             bin: rustspeck
             suffix: macos-arm64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
@@ -73,7 +73,7 @@ jobs:
           "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ env.ASSET }}
           generate_release_notes: true
