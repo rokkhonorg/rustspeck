@@ -50,9 +50,23 @@ const FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono.ttf");
 const UI_FONT: &str = "Geist";
 const UI_FONT_BYTES: &[u8] = include_bytes!("../assets/Geist.ttf");
 
-// Fixed render resolution; gpui GPU-scales it to fill the centre area.
+// Initial render resolution. The heatmap is computed at this size and gpui
+// GPU-scales it to fill the centre area; once the window settles at a larger
+// size, it's re-rendered at the area's native device-pixel resolution (see the
+// resize handling in `render`) so it stays crisp instead of being upscaled.
 const RENDER_COLS: i32 = 2400;
 const RENDER_HEIGHT: i32 = 1320;
+
+/// Debounce before re-rendering at a new native resolution, so dragging the
+/// window edge doesn't kick off a re-analysis every frame.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(180);
+/// Ignore growth smaller than this (device px) to avoid churn on sub-pixel jitter.
+const RESIZE_GROW_MARGIN: i32 = 16;
+/// Caps on the rendered texture so a huge window can't blow up memory or exceed
+/// GPU texture limits. We only ever grow toward the displayed size, never past
+/// these.
+const MAX_RENDER_W: i32 = 8192;
+const MAX_RENDER_H: i32 = 8192;
 
 // Gutter sizes (logical px).
 const FREQ_W: f64 = 72.0;
@@ -203,6 +217,14 @@ enum LoadMsg {
 /// UI thread drains it and applies each one in order.
 type Sender = async_channel::Sender<(u64, LoadMsg)>;
 
+/// Texture resolution to render the heatmap at (device px). `w` is the column
+/// count (time axis); `h` is the total height the auto FFT geometry fits into.
+#[derive(Clone, Copy)]
+struct RenderSize {
+    w: i32,
+    h: i32,
+}
+
 /// The root view: holds all the state the previous floem build kept in signals.
 struct SpekApp {
     tx: Sender,
@@ -214,6 +236,20 @@ struct SpekApp {
     info: TrackInfo,
     meta: Option<SpecMeta>,
     legend: Arc<RenderImage>, // dBFS colour-scale gradient bar
+    // Heatmap texture resolution in device px. `want_*` tracks the displayed
+    // size live (grow-only) and is updated every render even before a file is
+    // loaded, so the *first* load already renders at native resolution instead
+    // of rendering at the default and immediately re-rendering. `render_*` is the
+    // size the current images were actually built at; when `want` outgrows it we
+    // re-render. `resize_gen` tags the in-flight debounce so a newer resize wins.
+    want_w: i32,
+    want_h: i32,
+    render_w: i32,
+    render_h: i32,
+    resize_gen: u64,
+    // An initial (CLI) file to load on the first render, once the window size is
+    // known — so it, too, loads at native resolution.
+    pending_load: Option<PathBuf>,
 }
 
 impl SpekApp {
@@ -236,6 +272,12 @@ impl SpekApp {
             info: TrackInfo::default(),
             meta: None,
             legend,
+            want_w: RENDER_COLS,
+            want_h: RENDER_HEIGHT,
+            render_w: RENDER_COLS,
+            render_h: RENDER_HEIGHT,
+            resize_gen: 0,
+            pending_load: None,
         }
     }
 
@@ -244,14 +286,21 @@ impl SpekApp {
     /// supersedes any in-flight load.
     fn load(&mut self, path: PathBuf, _cx: &mut Context<Self>) {
         self.path = Some(path.clone());
+        // Render at the size the window currently wants (native resolution).
+        self.render_w = self.want_w;
+        self.render_h = self.want_h;
         let my_gen = LOAD_GEN.fetch_add(1, Ordering::SeqCst) + 1;
         let tx = self.tx.clone();
         let analysis = self.analysis;
+        let render = RenderSize {
+            w: self.render_w,
+            h: self.render_h,
+        };
         std::thread::spawn(move || {
             let emit = |msg: LoadMsg| {
                 let _ = tx.send_blocking((my_gen, msg));
             };
-            if let Err(e) = worker(&path, analysis, my_gen, &emit) {
+            if let Err(e) = worker(&path, analysis, render, my_gen, &emit) {
                 emit(LoadMsg::Err(format!(
                     "Failed to load {}: {e}",
                     file_name(&path)
@@ -260,12 +309,48 @@ impl SpekApp {
         });
     }
 
-    /// Re-run the analysis for the current track (after `f`/`w` changed a
-    /// parameter). No-op when no track is loaded yet.
+    /// Re-run the analysis for the current track (after `f`/`w` or a resize
+    /// changed a parameter). No-op when no track is loaded yet.
     fn reanalyse(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = self.path.clone() {
             self.load(path, cx);
         }
+    }
+
+    /// Called each render with the centre area's native (device-pixel) size.
+    /// Tracks the wanted resolution live (grow-only) so a later load renders at
+    /// native size, kicks off a deferred initial (CLI) load once the size is
+    /// known, and — for an already-loaded track that the window has outgrown —
+    /// schedules a debounced re-render at the larger resolution. Shrinking needs
+    /// nothing: a bigger texture downscales sharply; only upscaling looks blurry.
+    fn note_area(&mut self, dev_w: i32, dev_h: i32, cx: &mut Context<Self>) {
+        self.want_w = dev_w.clamp(self.want_w, MAX_RENDER_W);
+        self.want_h = dev_h.clamp(self.want_h, MAX_RENDER_H);
+
+        if let Some(path) = self.pending_load.take() {
+            self.load(path, cx); // first load, now at native resolution
+        } else if self.path.is_some()
+            && (self.want_w - self.render_w > RESIZE_GROW_MARGIN
+                || self.want_h - self.render_h > RESIZE_GROW_MARGIN)
+        {
+            self.schedule_resize(cx);
+        }
+    }
+
+    /// Start (or restart) the debounce that re-renders at the current `want_*`.
+    /// A newer resize bumps `resize_gen`, so only the last one in a burst fires.
+    fn schedule_resize(&mut self, cx: &mut Context<Self>) {
+        self.resize_gen = self.resize_gen.wrapping_add(1);
+        let token = self.resize_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RESIZE_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.resize_gen == token {
+                    this.reanalyse(cx); // load() re-reads want_* as the new size
+                }
+            });
+        })
+        .detach();
     }
 
     /// The FFT size currently in effect: the explicit override if set, else the
@@ -331,6 +416,11 @@ impl Render for SpekApp {
         // the fixed gutters. Tick positions are derived from this each render.
         let vp = window.viewport_size();
         let (area_w, area_h) = centre_area(f32::from(vp.width) as f64, f32::from(vp.height) as f64);
+
+        // Track the area's native device-pixel size so the heatmap can be
+        // re-rendered at full resolution when the window grows (see `note_area`).
+        let scale = window.scale_factor() as f64;
+        self.note_area((area_w * scale).round() as i32, (area_h * scale).round() as i32, cx);
 
         // --- Title row ---
         let title = if self.info.line1.is_empty() {
@@ -567,9 +657,11 @@ pub fn run(initial: Option<PathBuf>, fft_size: Option<i32>) -> Result<(), String
         })
         .detach();
 
-        // Load any file given on the command line — streamed like a drag-and-drop.
+        // Queue any file given on the command line; the first render starts the
+        // load once the window's native size is known, so it renders sharp from
+        // the start instead of at the default resolution and then re-rendering.
         if let Some(path) = initial {
-            let _ = handle.update(cx, |app, _window, cx| app.load(path, cx));
+            let _ = handle.update(cx, |app, _window, _cx| app.pending_load = Some(path));
         }
 
         cx.activate(true);
@@ -621,6 +713,7 @@ const PUBLISH_INTERVAL: Duration = Duration::from_micros(1_000_000 / TARGET_FPS)
 fn worker(
     path: &Path,
     analysis: Analysis,
+    render: RenderSize,
     my_gen: u64,
     sink: &dyn Fn(LoadMsg),
 ) -> Result<(), String> {
@@ -629,7 +722,7 @@ fn worker(
     let mut dec = audio::open(path)?;
     let rate = dec.rate();
     let channels = dec.channels();
-    let cfg = gui_config(analysis)?;
+    let cfg = gui_config(analysis, render)?;
 
     let Some(total_len) = dec.total_len() else {
         // Length unknown: decode fully, then render once (no progressive fill).
@@ -645,7 +738,7 @@ fn worker(
             channels,
             samples,
         };
-        let (rgbas, meta) = build_image(&audio, analysis)?;
+        let (rgbas, meta) = build_image(&audio, analysis, render)?;
         sink(LoadMsg::Meta(
             meta,
             track_info(path, rate, channels, &meta, analysis.win_type),
@@ -705,16 +798,18 @@ fn worker(
     Ok(())
 }
 
-/// The Config the GUI renders with: a fixed high render resolution that gpui
-/// GPU-scales to the window, optionally overriding the FFT size.
-fn gui_config(analysis: Analysis) -> Result<Config, String> {
+/// The Config the GUI renders with: `render` columns wide (the area's native
+/// width, so gpui scales the heatmap down rather than up), optionally overriding
+/// the FFT size. With no FFT override the frequency resolution tracks the render
+/// height too, so growing the window sharpens both axes.
+fn gui_config(analysis: Analysis, render: RenderSize) -> Result<Config, String> {
     let mut cfg = Config::default();
-    cfg.x_size0 = RENDER_COLS;
+    cfg.x_size0 = render.w;
     cfg.win_type = analysis.win_type;
     match analysis.fft_size {
         // y_size sets dft per channel directly: dft = 2*(y_size-1) = n.
         Some(n) => cfg.y_size = n / 2 + 1,
-        None => cfg.big_y_size = RENDER_HEIGHT,
+        None => cfg.big_y_size = render.h,
     }
     cfg.finalize()
 }
@@ -737,8 +832,9 @@ fn meta_from_proc(p: &StreamProcessor) -> SpecMeta {
 fn build_image(
     a: &Audio,
     analysis: Analysis,
+    render: RenderSize,
 ) -> Result<(Vec<(usize, usize, Vec<u8>)>, SpecMeta), String> {
-    let cfg = gui_config(analysis)?;
+    let cfg = gui_config(analysis, render)?;
     let spec = spectrogram::process(cfg, a.rate, a.channels, &a.samples)?;
     let meta = SpecMeta::from(&spec);
     let rgbas = render::channel_images(&spec);

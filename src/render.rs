@@ -424,17 +424,13 @@ fn channel_bgra(spec: &Spectrogram, k: usize, palette: &[u8]) -> (usize, usize, 
 }
 
 /// Per-channel texture height for the GUI. We keep full frequency resolution in
-/// the dBfs data and the PNG/CLI output, but the GPU textures are capped so all
-/// channels' textures fit together in floem/vger's shared atlas, which only
-/// holds a handful of large regions (a 2400-wide region takes a full atlas row).
-/// Without this, a multi-channel file with a tall FFT overflows the atlas: some
-/// channels never paint and the atlas thrashes (re-uploading every frame, which
-/// is what makes resizing stutter). The bands are small on screen, so capping
-/// the texture height is visually imperceptible.
+/// the dBfs data and the PNG/CLI output, but cap each channel's GPU texture so a
+/// tall FFT can't exceed the GPU's maximum texture dimension (commonly 16384).
+/// The budget is shared across channels and sits comfortably under that limit;
+/// since the heatmap is rendered at roughly the window's device-pixel height,
+/// the cap only bites at extreme window sizes.
 fn gui_tex_rows(rows: i32, chans: usize) -> i32 {
-    // Vertical texture budget shared across channels. Keeps the atlas square
-    // side (2 * max dimension) within GPU limits and leaves room for the legend.
-    const TOTAL_BUDGET: i32 = 3600;
+    const TOTAL_BUDGET: i32 = 8192;
     let cap = (TOTAL_BUDGET / chans.max(1) as i32).max(1);
     rows.min(cap)
 }
