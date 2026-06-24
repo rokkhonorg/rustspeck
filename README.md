@@ -35,6 +35,14 @@ arguments and drag a file in):
 rustspeck song.flac
 ```
 
+With a track loaded, these keys re-render it live:
+
+| Key | Action |
+|-----|--------|
+| `f` / `Shift+F` | step the FFT size up / down (powers of two) |
+| `w` | cycle the window function |
+| `c` | cycle the colour palette |
+
 ## CLI (render a PNG)
 
 Pass `--output`/`-o` to render a PNG instead of opening the viewer (`-o -`
@@ -57,6 +65,7 @@ Common options (run `rustspeck --help` for the full list):
 | `-z, --db-range <DB>` | dynamic range in dB |
 | `-Z, --db-max <DBFS>` | level mapped to the brightest colour |
 | `-w, --window <NAME>` | window function (hann, hamming, kaiser, …) |
+| `--palette <NAME>` | colour gradient: sox (default), viridis, magma, inferno, plasma, grayscale, green, amber |
 | `-m, --monochrome` / `-l, --light-background` | appearance |
 | `-t, --title <TEXT>` | title drawn above the image |
 

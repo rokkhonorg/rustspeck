@@ -34,6 +34,7 @@ pub mod render;
 pub mod spectrogram;
 pub mod window;
 
+mod colormaps;
 mod fft;
 mod tables;
 mod timeparse;
@@ -44,6 +45,7 @@ pub mod gui;
 use std::path::Path;
 
 pub use image::RgbaImage;
+pub use render::Palette;
 pub use spectrogram::{Config, MAX_X_SIZE, MAX_Y_SIZE, Spectrogram, StreamProcessor, process};
 pub use window::WindowType;
 

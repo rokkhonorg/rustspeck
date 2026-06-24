@@ -33,7 +33,7 @@ use smallvec::SmallVec;
 use strum::IntoEnumIterator;
 
 use crate::audio::{self, Audio};
-use crate::render;
+use crate::render::{self, Palette};
 use crate::spectrogram::{self, Config, StreamProcessor};
 use crate::window::WindowType;
 
@@ -91,13 +91,14 @@ fn p(x: f64) -> Pixels {
     px(x as f32)
 }
 
-/// The analysis parameters the user can cycle live from the keyboard. `Copy` so
+/// The render parameters the user can cycle live from the keyboard. `Copy` so
 /// the worker thread can take it by value.
 #[derive(Clone, Copy)]
 struct Analysis {
     /// FFT size override (DFT points). `None` = derive height automatically.
     fft_size: Option<i32>,
     win_type: WindowType,
+    palette: Palette,
 }
 
 /// FFT sizes the `f` / `Shift+F` keys cycle through (powers of two, 128 … 16384).
@@ -122,11 +123,12 @@ fn fft_down(cur: i32) -> i32 {
         .unwrap_or(FFT_SIZES[FFT_SIZES.len() - 1])
 }
 
-/// Next window function in the cycle (`strum::EnumIter`, wrapping around).
-fn next_window(current: WindowType) -> WindowType {
-    WindowType::iter()
+/// Next variant after `current` in `strum::EnumIter` order, wrapping around.
+/// Used to cycle the window function (`w`) and the colour palette (`c`).
+fn cycle_next<T: IntoEnumIterator + PartialEq + Copy>(current: T) -> T {
+    T::iter()
         .cycle()
-        .skip_while(|&w| w != current)
+        .skip_while(|&v| v != current)
         .nth(1)
         .expect("EnumIter is non-empty")
 }
@@ -264,6 +266,7 @@ impl SpekApp {
             analysis: Analysis {
                 fft_size,
                 win_type: WindowType::Hann,
+                palette: Palette::Sox,
             },
             path: None,
             focus_handle,
@@ -378,7 +381,18 @@ impl SpekApp {
         if self.path.is_none() {
             return;
         }
-        self.analysis.win_type = next_window(self.analysis.win_type);
+        self.analysis.win_type = cycle_next(self.analysis.win_type);
+        self.reanalyse(cx);
+    }
+
+    /// `c`: cycle the colour palette. Only acts when a track is present. Rebuilds
+    /// the legend bar immediately (cheap) and re-renders the heatmap.
+    fn cycle_palette(&mut self, cx: &mut Context<Self>) {
+        if self.path.is_none() {
+            return;
+        }
+        self.analysis.palette = cycle_next(self.analysis.palette);
+        self.legend = make_legend(self.analysis.palette);
         self.reanalyse(cx);
     }
 
@@ -600,6 +614,7 @@ impl Render for SpekApp {
                 match ev.keystroke.key.as_str() {
                     "f" => this.cycle_fft(m.shift, cx),
                     "w" => this.cycle_window(cx),
+                    "c" => this.cycle_palette(cx),
                     _ => {}
                 }
             }))
@@ -623,7 +638,7 @@ pub fn run(initial: Option<PathBuf>, fft_size: Option<i32>) -> Result<(), String
             .add_fonts(vec![Cow::Borrowed(FONT_BYTES), Cow::Borrowed(UI_FONT_BYTES)]);
 
         let (tx, rx) = async_channel::unbounded::<(u64, LoadMsg)>();
-        let legend = make_legend();
+        let legend = make_legend(Palette::Sox);
 
         let bounds = Bounds::centered(None, size(px(WIN_W as f32), px(WIN_H as f32)), cx);
         let handle = cx
@@ -672,8 +687,8 @@ pub fn run(initial: Option<PathBuf>, fft_size: Option<i32>) -> Result<(), String
 /// Build the dBFS colour-scale gradient bar as a single GPU image. The shared
 /// renderer emits it as an RGBA PNG; we decode it once at startup and swap to
 /// BGRA (unlike the channel images, which the renderer already emits as BGRA).
-fn make_legend() -> Arc<RenderImage> {
-    let png = render::legend_png(120).unwrap_or_default();
+fn make_legend(palette: Palette) -> Arc<RenderImage> {
+    let png = render::legend_png(120, palette).unwrap_or_default();
     let (w, h, mut bgra) = match image::load_from_memory(&png) {
         Ok(decoded) => {
             let buf = decoded.to_rgba8();
@@ -741,7 +756,7 @@ fn worker(
         let (rgbas, meta) = build_image(&audio, analysis, render)?;
         sink(LoadMsg::Meta(
             meta,
-            track_info(path, rate, channels, &meta, analysis.win_type),
+            track_info(path, rate, channels, &meta, analysis.win_type, analysis.palette),
         ));
         sink(LoadMsg::Done(make_images(rgbas)));
         return Ok(());
@@ -753,7 +768,7 @@ fn worker(
     let meta = meta_from_proc(&proc);
     sink(LoadMsg::Meta(
         meta,
-        track_info(path, rate, channels, &meta, analysis.win_type),
+        track_info(path, rate, channels, &meta, analysis.win_type, analysis.palette),
     ));
 
     // Feed roughly 100 ms of audio per push so the per-channel parallel FFT has
@@ -806,6 +821,7 @@ fn gui_config(analysis: Analysis, render: RenderSize) -> Result<Config, String> 
     let mut cfg = Config::default();
     cfg.x_size0 = render.w;
     cfg.win_type = analysis.win_type;
+    cfg.palette = analysis.palette;
     match analysis.fft_size {
         // y_size sets dft per channel directly: dft = 2*(y_size-1) = n.
         Some(n) => cfg.y_size = n / 2 + 1,
@@ -850,6 +866,7 @@ fn track_info(
     channels: u32,
     meta: &SpecMeta,
     win_type: WindowType,
+    palette: Palette,
 ) -> TrackInfo {
     let mut artist = None;
     let mut title = None;
@@ -889,10 +906,15 @@ fn track_info(
     let depth = bit_depth
         .map(|b| format!("{b}-bit"))
         .unwrap_or_else(|| "—".into());
-    let line2 = format!(
+    let mut line2 = format!(
         "{fmt} · {channels} ch · {sr} · {depth} · {}-pt · {win_type}",
         meta.dft_size
     );
+    // Show the palette only when it's been changed from the default, so the
+    // default metadata row is unchanged.
+    if palette != Palette::Sox {
+        line2.push_str(&format!(" · {palette}"));
+    }
 
     TrackInfo { line1, line2 }
 }

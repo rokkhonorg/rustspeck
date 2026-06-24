@@ -4,8 +4,60 @@
 
 use std::io::{Read, Write};
 
+use crate::colormaps;
 use crate::spectrogram::{Config, Spectrogram, StreamProcessor};
 use crate::tables::{ALT_PALETTE, FIXED_FONT_ZLIB};
+
+/// Colour gradient for the spectrogram. `Sox` is the original SoX heat map (and
+/// the only one that honours the `monochrome`/`high_colour`/`alt_palette`/`perm`
+/// flags); the rest are self-contained gradients sampled low-signal → high.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, strum::Display, strum::EnumIter)]
+pub enum Palette {
+    #[default]
+    Sox,
+    Viridis,
+    Magma,
+    Inferno,
+    Plasma,
+    Grayscale,
+    Green,
+    Amber,
+}
+
+/// Round a 0..1 channel value to a byte.
+fn byte(v: f64) -> u8 {
+    (0.5 + 255.0 * v.clamp(0.0, 1.0)) as u8
+}
+
+/// Sample an RGB8 colormap table (`len/3` entries) at `x` in 0..1, lerping.
+fn sample(table: &[u8], x: f64) -> [u8; 3] {
+    let n = table.len() / 3;
+    let pos = x.clamp(0.0, 1.0) * (n - 1) as f64;
+    let i = pos.floor() as usize;
+    let j = (i + 1).min(n - 1);
+    let f = pos - i as f64;
+    let lerp = |a: u8, b: u8| (a as f64 + (b as f64 - a as f64) * f).round() as u8;
+    [
+        lerp(table[i * 3], table[j * 3]),
+        lerp(table[i * 3 + 1], table[j * 3 + 1]),
+        lerp(table[i * 3 + 2], table[j * 3 + 2]),
+    ]
+}
+
+/// One spectrum colour for a (non-`Sox`) gradient at `x` in 0..1.
+fn gradient_rgb(p: Palette, x: f64) -> [u8; 3] {
+    match p {
+        Palette::Viridis => sample(&colormaps::VIRIDIS, x),
+        Palette::Magma => sample(&colormaps::MAGMA, x),
+        Palette::Inferno => sample(&colormaps::INFERNO, x),
+        Palette::Plasma => sample(&colormaps::PLASMA, x),
+        // Single-hue ramps that brighten toward white.
+        Palette::Grayscale => [byte(x), byte(x), byte(x)],
+        Palette::Green => [byte(x * x), byte(x), byte(x * x * 0.5)],
+        Palette::Amber => [byte(x), byte(x * 0.74), byte(x * x * 0.2)],
+        Palette::Sox => [0, 0, 0], // never reached; Sox is handled in make_palette
+    }
+}
 
 // Layout constants (#defines in spectrogram.c)
 const BELOW: i32 = 48;
@@ -137,6 +189,17 @@ fn make_palette(cfg: &Config) -> Vec<u8> {
         let mut c = [0.0f64; 3];
         let x = i as f64 / (sp - 1) as f64;
         let at = if cfg.light_background { sp - 1 - i } else { i };
+
+        // Non-SoX gradients are self-contained: sample the colormap directly and
+        // skip the SoX heat/high-colour/alt/perm machinery below.
+        if cfg.palette != Palette::Sox {
+            let rgb = gradient_rgb(cfg.palette, x);
+            let o = ((FIXED_PALETTE + at) * 3) as usize;
+            pal[o] = rgb[0];
+            pal[o + 1] = rgb[1];
+            pal[o + 2] = rgb[2];
+            continue;
+        }
 
         if cfg.monochrome {
             c[0] = x;
@@ -537,10 +600,11 @@ pub fn stream_channel_images(proc: &StreamProcessor) -> Vec<(usize, usize, Vec<u
 }
 
 /// Vertical dBFS colour-scale legend (0 dBFS at top → `-db_range` at bottom)
-/// matching the GUI's default palette, as PNG bytes. Stretched in the UI.
-pub fn legend_png(db_range: i32) -> Result<Vec<u8>, String> {
+/// matching the given `palette`, as PNG bytes. Stretched in the UI.
+pub fn legend_png(db_range: i32, palette: Palette) -> Result<Vec<u8>, String> {
     let mut cfg = Config::default();
     cfg.db_range = db_range;
+    cfg.palette = palette;
     let cfg = cfg.finalize()?;
     let palette = make_palette(&cfg);
     let w = 24usize;

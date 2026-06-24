@@ -44,6 +44,34 @@ impl From<WindowArg> for WindowType {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum PaletteArg {
+    Sox,
+    Viridis,
+    Magma,
+    Inferno,
+    Plasma,
+    Grayscale,
+    Green,
+    Amber,
+}
+
+impl From<PaletteArg> for rustspeck::Palette {
+    fn from(p: PaletteArg) -> Self {
+        use rustspeck::Palette as P;
+        match p {
+            PaletteArg::Sox => P::Sox,
+            PaletteArg::Viridis => P::Viridis,
+            PaletteArg::Magma => P::Magma,
+            PaletteArg::Inferno => P::Inferno,
+            PaletteArg::Plasma => P::Plasma,
+            PaletteArg::Grayscale => P::Grayscale,
+            PaletteArg::Green => P::Green,
+            PaletteArg::Amber => P::Amber,
+        }
+    }
+}
+
 /// View an audio file's spectrogram (a port of SoX `spectrogram`).
 ///
 /// Opens the GUI viewer by default; pass --output to render a PNG instead.
@@ -158,6 +186,12 @@ struct Args {
     #[arg(short = 'A', long = "alt-palette")]
     alt_palette: bool,
 
+    /// Colour gradient: sox (default heat map), viridis, magma, inferno, plasma,
+    /// grayscale, green, amber
+    #[arg(long, value_enum, ignore_case = true, default_value_t = PaletteArg::Sox,
+          value_name = "NAME")]
+    palette: PaletteArg,
+
     /// Suppress axis lines (keep labels)
     #[arg(short = 'a', long = "no-axis-lines")]
     no_axis_lines: bool,
@@ -231,6 +265,7 @@ fn build_config(args: &Args) -> Result<Config, String> {
         cfg.perm = v;
     }
     cfg.alt_palette = args.alt_palette;
+    cfg.palette = args.palette.into();
     cfg.no_axes = args.no_axis_lines;
     cfg.raw = args.raw;
     cfg.truncate = args.truncate;
