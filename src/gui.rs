@@ -50,12 +50,14 @@ const FONT_BYTES: &[u8] = include_bytes!("../assets/JetBrainsMono.ttf");
 const UI_FONT: &str = "Geist";
 const UI_FONT_BYTES: &[u8] = include_bytes!("../assets/Geist.ttf");
 
-// Initial render resolution. The heatmap is computed at this size and gpui
-// GPU-scales it to fill the centre area; once the window settles at a larger
-// size, it's re-rendered at the area's native device-pixel resolution (see the
-// resize handling in `render`) so it stays crisp instead of being upscaled.
-const RENDER_COLS: i32 = 2400;
-const RENDER_HEIGHT: i32 = 1320;
+// Minimum render resolution. The heatmap is rendered at the centre area's
+// native device-pixel size (see the resize handling in `render`) so it stays
+// crisp instead of being up/downscaled; these are just a floor so a tiny window
+// can't produce a degenerately small render. They sit below the default area
+// size, so at the default window the render tracks the area rather than
+// oversampling it.
+const MIN_RENDER_W: i32 = 1000;
+const MIN_RENDER_H: i32 = 600;
 
 /// Debounce before re-rendering at a new native resolution, so dragging the
 /// window edge doesn't kick off a re-analysis every frame.
@@ -275,10 +277,10 @@ impl SpekApp {
             info: TrackInfo::default(),
             meta: None,
             legend,
-            want_w: RENDER_COLS,
-            want_h: RENDER_HEIGHT,
-            render_w: RENDER_COLS,
-            render_h: RENDER_HEIGHT,
+            want_w: MIN_RENDER_W,
+            want_h: MIN_RENDER_H,
+            render_w: MIN_RENDER_W,
+            render_h: MIN_RENDER_H,
             resize_gen: 0,
             pending_load: None,
         }
